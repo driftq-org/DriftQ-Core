@@ -1,8 +1,12 @@
 # DriftQ Core
 
-> A lightweight, extensible message broker built in Go — designed for the AI-native era.
+<p align='center'>
+  <a href='https://drift-q.org' target="_blank">Website</a>
+</p>
 
-**DriftQ Core** is the open-source, high-performance message broker powering the AI-native messaging platform **DriftQ**.
+A lightweight, extensible message broker built in Go — designed for the AI-native era.
+
+**DriftQ Core** is the open-source, high-performance message broker powering the AI-native messaging platform DriftQ.
 
 ---
 
