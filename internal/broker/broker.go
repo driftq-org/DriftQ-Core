@@ -67,4 +67,20 @@ func (b *InMemoryBroker) ListTopics(_ context.Context) ([]string, error) {
 	return names, nil
 }
 
-// TODO: Produce + Consume will be implemented in later steps.
+// Produce appends a message to the given topic (in-memory only for now).
+func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	messages, exists := b.topics[topic]
+	if !exists {
+		return errors.New("topic does not exist (create it first)")
+	}
+
+	b.topics[topic] = append(messages, msg)
+	return nil
+}
