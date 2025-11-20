@@ -84,3 +84,37 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	b.topics[topic] = append(messages, msg)
 	return nil
 }
+
+// Consume returns a channel that will receive all current messages
+// for the given topic, then close. Consumer group is ignored for now.
+func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string) (<-chan Message, error) {
+	if topic == "" {
+		return nil, errors.New("topic cannot be empty")
+	}
+	if group == "" {
+		return nil, errors.New("group cannot be empty (MVP requirement)")
+	}
+
+	out := make(chan Message)
+
+	b.mu.RLock()
+	messages, exists := b.topics[topic]
+	b.mu.RUnlock()
+	if !exists {
+		return nil, errors.New("topic does not exist")
+	}
+
+	// Replay current messages in a goroutine so caller can read asynchronously.
+	go func(msgs []Message) {
+		defer close(out)
+		for _, m := range msgs {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- m:
+			}
+		}
+	}(append([]Message(nil), messages...)) // copy slice to avoid races
+
+	return out, nil
+}
