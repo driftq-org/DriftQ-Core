@@ -35,6 +35,8 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/produce", s.handleProduce)
+	mux.HandleFunc("/consume", s.handleConsume)
 
 	// Dev-only topic admin endpoints
 	mux.HandleFunc("/topics", s.handleTopics)
@@ -112,4 +114,70 @@ func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	topic := r.URL.Query().Get("topic")
+	key := r.URL.Query().Get("key")
+	value := r.URL.Query().Get("value")
+
+	if topic == "" || value == "" {
+		http.Error(w, "topic and value are required", http.StatusBadRequest)
+		return
+	}
+
+	msg := broker.Message{
+		Key:   []byte(key),
+		Value: []byte(value),
+	}
+
+	if err := s.broker.Produce(ctx, topic, msg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	_, _ = w.Write([]byte("produced\n"))
+}
+
+func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	topic := r.URL.Query().Get("topic")
+	group := r.URL.Query().Get("group")
+	if topic == "" || group == "" {
+		http.Error(w, "topic and group are required", http.StatusBadRequest)
+		return
+	}
+
+	ch, err := s.broker.Consume(ctx, topic, group)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Collect all messages into a slice for JSON response.
+	msgs := []map[string]string{}
+	for m := range ch {
+		msgs = append(msgs, map[string]string{
+			"key":   string(m.Key),
+			"value": string(m.Value),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"messages": msgs,
+	})
 }
