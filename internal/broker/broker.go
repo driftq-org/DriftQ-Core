@@ -8,8 +8,9 @@ import (
 )
 
 type Message struct {
-	Key   []byte
-	Value []byte
+	offset int64
+	Key    []byte
+	Value  []byte
 }
 
 // Broker is the core interface for the MVP message broker
@@ -19,6 +20,8 @@ type Broker interface {
 
 	Produce(ctx context.Context, topic string, msg Message) error
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
+
+	Ack(ctx context.Context, topic, group string, offset int64) error
 }
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
