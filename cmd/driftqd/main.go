@@ -37,6 +37,7 @@ func main() {
 	})
 	mux.HandleFunc("/produce", s.handleProduce)
 	mux.HandleFunc("/consume", s.handleConsume)
+	mux.HandleFunc("/ack", s.handleAck)
 
 	// Dev-only topic admin endpoints
 	mux.HandleFunc("/topics", s.handleTopics)
@@ -180,4 +181,35 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"messages": msgs,
 	})
+}
+
+func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	topic := r.URL.Query().Get("topic")
+	group := r.URL.Query().Get("group")
+	offsetStr := r.URL.Query().Get("offset")
+
+	if topic == "" || group == "" || offsetStr == "" {
+		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
+		return
+	}
+
+	offset, err := strconv.ParseInt(offsetStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.broker.Ack(ctx, topic, group, offset); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	_, _ = w.Write([]byte("acked\n"))
 }
