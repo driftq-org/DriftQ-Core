@@ -92,7 +92,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 // Consume returns a channel that will receive all current messages
 // for the given topic, then close. Consumer group is ignored for now.
-func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string) (<-chan Message, error) {
+func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-chan Message, error) {
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
 	}
@@ -104,17 +104,33 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 
 	b.mu.RLock()
 	messages, exists := b.topics[topic]
-	b.mu.RUnlock()
-
 	if !exists {
+		b.mu.RUnlock()
 		return nil, errors.New("topic does not exist")
 	}
 
-	// Replay current messages in a goroutine so caller can read asynchronously.
-	go func(msgs []Message) {
+	// Figure out where this consumer group should start.
+	var startOffset int64 = 0
+	if groups, ok := b.consumerOffsets[topic]; ok {
+		if last, ok := groups[group]; ok {
+			startOffset = last + 1 // resume from next message after last acked
+		}
+	}
+
+	// Clamp / handle out-of-range.
+	if startOffset < 0 || startOffset > int64(len(messages)) {
+		startOffset = int64(len(messages)) // nothing to read
+	}
+
+	// Copy only the slice from startOffset onward to avoid races.
+	msgs := append([]Message(nil), messages[startOffset:]...)
+	b.mu.RUnlock()
+
+	// Replay messages asynchronously.
+	go func(baseOffset int64, msgs []Message) {
 		defer close(out)
 		for i, m := range msgs {
-			m.Offset = int64(i)
+			m.Offset = baseOffset + int64(i)
 
 			select {
 			case <-ctx.Done():
@@ -122,7 +138,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 			case out <- m:
 			}
 		}
-	}(append([]Message(nil), messages...)) // copy slice to avoid races
+	}(startOffset, msgs)
 
 	return out, nil
 }
