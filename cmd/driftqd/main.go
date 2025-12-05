@@ -169,11 +169,18 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect all messages into a slice for JSON response.
-	msgs := []map[string]string{}
+	type consumedMessage struct {
+		Offset int64  `json:"offset"`
+		Key    string `json:"key"`
+		Value  string `json:"value"`
+	}
+
+	msgs := []consumedMessage{}
 	for m := range ch {
-		msgs = append(msgs, map[string]string{
-			"key":   string(m.Key),
-			"value": string(m.Value),
+		msgs = append(msgs, consumedMessage{
+			Offset: m.Offset,
+			Key:    string(m.Key),
+			Value:  string(m.Value),
 		})
 	}
 
