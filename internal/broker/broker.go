@@ -26,14 +26,16 @@ type Broker interface {
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
-	mu     sync.RWMutex
-	topics map[string][]Message
+	mu              sync.RWMutex
+	topics          map[string][]Message
+	consumerOffsets map[string]map[string]int64
 }
 
 // NewInMemoryBroker creates a new in-memory broker instance.
 func NewInMemoryBroker() *InMemoryBroker {
 	return &InMemoryBroker{
-		topics: make(map[string][]Message),
+		topics:          make(map[string][]Message),
+		consumerOffsets: make(map[string]map[string]int64),
 	}
 }
 
@@ -138,6 +140,22 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 		return errors.New("offset cannot be negative")
 	}
 
-	// For now, this is a no-op. Real consumer state comes next. (TODO)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, ok := b.topics[topic]; !ok {
+		return errors.New("topic does not exist")
+	}
+
+	// Get or create group map for this topic.
+	groups, ok := b.consumerOffsets[topic]
+	if !ok {
+		groups = make(map[string]int64)
+		b.consumerOffsets[topic] = groups
+	}
+
+	// Store the last processed offset for this group.
+	groups[group] = offset
+
 	return nil
 }
