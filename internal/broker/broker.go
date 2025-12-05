@@ -8,7 +8,7 @@ import (
 )
 
 type Message struct {
-	offset int64
+	Offset int64
 	Key    []byte
 	Value  []byte
 }
@@ -103,6 +103,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 	b.mu.RLock()
 	messages, exists := b.topics[topic]
 	b.mu.RUnlock()
+
 	if !exists {
 		return nil, errors.New("topic does not exist")
 	}
@@ -110,7 +111,9 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 	// Replay current messages in a goroutine so caller can read asynchronously.
 	go func(msgs []Message) {
 		defer close(out)
-		for _, m := range msgs {
+		for i, m := range msgs {
+			m.Offset = int64(i)
+
 			select {
 			case <-ctx.Done():
 				return
@@ -120,4 +123,21 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 	}(append([]Message(nil), messages...)) // copy slice to avoid races
 
 	return out, nil
+}
+
+func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int64) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return errors.New("group cannot be empty")
+	}
+
+	if offset < 0 {
+		return errors.New("offset cannot be negative")
+	}
+
+	// For now, this is a no-op. Real consumer state comes next. (TODO)
+	return nil
 }
