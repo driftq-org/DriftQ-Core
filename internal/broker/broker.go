@@ -8,8 +8,9 @@ import (
 )
 
 type Message struct {
-	Key   []byte
-	Value []byte
+	Offset int64
+	Key    []byte
+	Value  []byte
 }
 
 // Broker is the core interface for the MVP message broker
@@ -19,18 +20,22 @@ type Broker interface {
 
 	Produce(ctx context.Context, topic string, msg Message) error
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
+
+	Ack(ctx context.Context, topic, group string, offset int64) error
 }
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
-	mu     sync.RWMutex
-	topics map[string][]Message
+	mu              sync.RWMutex
+	topics          map[string][]Message
+	consumerOffsets map[string]map[string]int64
 }
 
 // NewInMemoryBroker creates a new in-memory broker instance.
 func NewInMemoryBroker() *InMemoryBroker {
 	return &InMemoryBroker{
-		topics: make(map[string][]Message),
+		topics:          make(map[string][]Message),
+		consumerOffsets: make(map[string]map[string]int64),
 	}
 }
 
@@ -87,7 +92,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 // Consume returns a channel that will receive all current messages
 // for the given topic, then close. Consumer group is ignored for now.
-func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string) (<-chan Message, error) {
+func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-chan Message, error) {
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
 	}
@@ -99,22 +104,74 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic string, group string
 
 	b.mu.RLock()
 	messages, exists := b.topics[topic]
-	b.mu.RUnlock()
 	if !exists {
+		b.mu.RUnlock()
 		return nil, errors.New("topic does not exist")
 	}
 
-	// Replay current messages in a goroutine so caller can read asynchronously.
-	go func(msgs []Message) {
+	// Figure out where this consumer group should start.
+	var startOffset int64 = 0
+	if groups, ok := b.consumerOffsets[topic]; ok {
+		if last, ok := groups[group]; ok {
+			startOffset = last + 1 // resume from next message after last acked
+		}
+	}
+
+	// Clamp / handle out-of-range.
+	if startOffset < 0 || startOffset > int64(len(messages)) {
+		startOffset = int64(len(messages)) // nothing to read
+	}
+
+	// Copy only the slice from startOffset onward to avoid races.
+	msgs := append([]Message(nil), messages[startOffset:]...)
+	b.mu.RUnlock()
+
+	// Replay messages asynchronously.
+	go func(baseOffset int64, msgs []Message) {
 		defer close(out)
-		for _, m := range msgs {
+		for i, m := range msgs {
+			m.Offset = baseOffset + int64(i)
+
 			select {
 			case <-ctx.Done():
 				return
 			case out <- m:
 			}
 		}
-	}(append([]Message(nil), messages...)) // copy slice to avoid races
+	}(startOffset, msgs)
 
 	return out, nil
+}
+
+func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int64) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return errors.New("group cannot be empty")
+	}
+
+	if offset < 0 {
+		return errors.New("offset cannot be negative")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, ok := b.topics[topic]; !ok {
+		return errors.New("topic does not exist")
+	}
+
+	// Get or create group map for this topic.
+	groups, ok := b.consumerOffsets[topic]
+	if !ok {
+		groups = make(map[string]int64)
+		b.consumerOffsets[topic] = groups
+	}
+
+	// Store the last processed offset for this group.
+	groups[group] = offset
+
+	return nil
 }
