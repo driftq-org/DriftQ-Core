@@ -37,6 +37,7 @@ func NewInMemoryBroker() *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string][]Message),
 		consumerOffsets: make(map[string]map[string]int64),
+		consumerChans:   make(map[string]map[string][]chan Message),
 	}
 }
 
