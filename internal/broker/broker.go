@@ -128,9 +128,38 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	msgs := append([]Message(nil), messages[startOffset:]...)
 	b.mu.RUnlock()
 
+	// Register this consumer channel for future streaming!
+	b.mu.Lock()
+	groupChans, ok := b.consumerChans[topic]
+	if !ok {
+		groupChans = make(map[string][]chan Message)
+		b.consumerChans[topic] = groupChans
+	}
+	groupChans[group] = append(groupChans[group], out)
+	b.mu.Unlock()
+
 	// Replay messages asynchronously.
 	go func(baseOffset int64, msgs []Message) {
-		defer close(out)
+		defer func() {
+			// Unregister this consumer channel.
+			b.mu.Lock()
+			if groupChans, ok := b.consumerChans[topic]; ok {
+				chans := groupChans[group]
+				for i, ch := range chans {
+					if ch == out {
+						groupChans[group] = append(chans[:i], chans[i+1:]...)
+						break
+					}
+				}
+				if len(groupChans[group]) == 0 {
+					delete(groupChans, group)
+				}
+			}
+			b.mu.Unlock()
+
+			close(out)
+		}()
+
 		for i, m := range msgs {
 			m.Offset = baseOffset + int64(i)
 
