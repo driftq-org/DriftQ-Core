@@ -28,7 +28,8 @@ type Broker interface {
 type InMemoryBroker struct {
 	mu              sync.RWMutex
 	topics          map[string][]Message
-	consumerOffsets map[string]map[string]int64
+	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
+	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 }
 
 // NewInMemoryBroker creates a new in-memory broker instance.
