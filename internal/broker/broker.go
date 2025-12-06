@@ -28,7 +28,8 @@ type Broker interface {
 type InMemoryBroker struct {
 	mu              sync.RWMutex
 	topics          map[string][]Message
-	consumerOffsets map[string]map[string]int64
+	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
+	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 }
 
 // NewInMemoryBroker creates a new in-memory broker instance.
@@ -36,6 +37,7 @@ func NewInMemoryBroker() *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string][]Message),
 		consumerOffsets: make(map[string]map[string]int64),
+		consumerChans:   make(map[string]map[string][]chan Message),
 	}
 }
 
@@ -72,21 +74,41 @@ func (b *InMemoryBroker) ListTopics(_ context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Produce appends a message to the given topic (in-memory only for now).
+// Produce appends a message to the given topic (in-memory only for now)
+// and delievers it to anya ctive consumers for that topic :)
 func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	messages, exists := b.topics[topic]
 	if !exists {
+		b.mu.Unlock()
 		return errors.New("topic does not exist (create it first)")
 	}
 
+	msg.Offset = int64(len(messages))
 	b.topics[topic] = append(messages, msg)
+
+	// Snapshot of all active consumer channels for this topic!!
+	var chansToNotify []chan Message
+	if groupChans, ok := b.consumerChans[topic]; ok {
+		for _, chans := range groupChans {
+			chansToNotify = append(chansToNotify, chans...)
+		}
+	}
+
+	b.mu.Unlock()
+
+	// Fan-out to active consumers asynchronously.
+	go func(m Message, chans []chan Message) {
+		for _, ch := range chans {
+			// Best-effort: if a consumer is slow, Produce may block here. That's ONLY acceptable for MVP; Needs refinement later
+			ch <- m
+		}
+	}(msg, chansToNotify)
+
 	return nil
 }
 
@@ -96,6 +118,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
 	}
+
 	if group == "" {
 		return nil, errors.New("group cannot be empty (MVP requirement)")
 	}
@@ -123,22 +146,56 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	}
 
 	// Copy only the slice from startOffset onward to avoid races.
-	msgs := append([]Message(nil), messages[startOffset:]...)
+	initial := append([]Message(nil), messages[startOffset:]...)
 	b.mu.RUnlock()
 
-	// Replay messages asynchronously.
-	go func(baseOffset int64, msgs []Message) {
-		defer close(out)
-		for i, m := range msgs {
-			m.Offset = baseOffset + int64(i)
+	// Register this consumer channel for future streaming!
+	b.mu.Lock()
+	groupChans, ok := b.consumerChans[topic]
+	if !ok {
+		groupChans = make(map[string][]chan Message)
+		b.consumerChans[topic] = groupChans
+	}
+	groupChans[group] = append(groupChans[group], out)
+	b.mu.Unlock()
 
+	// Goroutine we got:
+	//  - sends initial snapshot
+	//  - then just waits for ctx cancellation (new messages are pushed by Produce directly into `out`)
+	go func(baseOffset int64, initial []Message) {
+		defer func() {
+			// Unregister this consumer channel.
+			b.mu.Lock()
+			if groupChans, ok := b.consumerChans[topic]; ok {
+				chans := groupChans[group]
+				for i, ch := range chans {
+					if ch == out {
+						groupChans[group] = append(chans[:i], chans[i+1:]...)
+						break
+					}
+				}
+
+				if len(groupChans[group]) == 0 {
+					delete(groupChans, group)
+				}
+			}
+			b.mu.Unlock()
+
+			close(out)
+		}()
+
+		// Send existing messages first.
+		for i, m := range initial {
+			m.Offset = baseOffset + int64(i)
 			select {
 			case <-ctx.Done():
 				return
 			case out <- m:
 			}
 		}
-	}(startOffset, msgs)
+
+		<-ctx.Done()
+	}(startOffset, initial)
 
 	return out, nil
 }
