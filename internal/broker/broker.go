@@ -74,21 +74,41 @@ func (b *InMemoryBroker) ListTopics(_ context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Produce appends a message to the given topic (in-memory only for now).
+// Produce appends a message to the given topic (in-memory only for now)
+// and delievers it to anya ctive consumers for that topic :)
 func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	messages, exists := b.topics[topic]
 	if !exists {
+		b.mu.Unlock()
 		return errors.New("topic does not exist (create it first)")
 	}
 
+	msg.Offset = int64(len(messages))
 	b.topics[topic] = append(messages, msg)
+
+	// Snapshot of all active consumer channels for this topic!!
+	var chansToNotify []chan Message
+	if groupChans, ok := b.consumerChans[topic]; ok {
+		for _, chans := range groupChans {
+			chansToNotify = append(chansToNotify, chans...)
+		}
+	}
+
+	b.mu.Unlock()
+
+	// Fan-out to active consumers asynchronously.
+	go func(m Message, chans []chan Message) {
+		for _, ch := range chans {
+			// Best-effort: if a consumer is slow, Produce may block here. That's ONLY acceptable for MVP; Needs refinement later
+			ch <- m
+		}
+	}(msg, chansToNotify)
+
 	return nil
 }
 
@@ -141,7 +161,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	// Replay messages asynchronously.
 	go func(baseOffset int64, msgs []Message) {
 		defer func() {
-			// Unregister this consumer channel.
+			// Unregister this consumer channel
 			b.mu.Lock()
 			if groupChans, ok := b.consumerChans[topic]; ok {
 				chans := groupChans[group]
@@ -151,6 +171,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 						break
 					}
 				}
+
 				if len(groupChans[group]) == 0 {
 					delete(groupChans, group)
 				}
