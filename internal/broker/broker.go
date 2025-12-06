@@ -118,6 +118,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
 	}
+
 	if group == "" {
 		return nil, errors.New("group cannot be empty (MVP requirement)")
 	}
@@ -145,7 +146,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	}
 
 	// Copy only the slice from startOffset onward to avoid races.
-	msgs := append([]Message(nil), messages[startOffset:]...)
+	initial := append([]Message(nil), messages[startOffset:]...)
 	b.mu.RUnlock()
 
 	// Register this consumer channel for future streaming!
@@ -158,10 +159,12 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	groupChans[group] = append(groupChans[group], out)
 	b.mu.Unlock()
 
-	// Replay messages asynchronously.
-	go func(baseOffset int64, msgs []Message) {
+	// Goroutine we got:
+	//  - sends initial snapshot
+	//  - then just waits for ctx cancellation (new messages are pushed by Produce directly into `out`)
+	go func(baseOffset int64, initial []Message) {
 		defer func() {
-			// Unregister this consumer channel
+			// Unregister this consumer channel.
 			b.mu.Lock()
 			if groupChans, ok := b.consumerChans[topic]; ok {
 				chans := groupChans[group]
@@ -181,16 +184,18 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		for i, m := range msgs {
+		// Send existing messages first.
+		for i, m := range initial {
 			m.Offset = baseOffset + int64(i)
-
 			select {
 			case <-ctx.Done():
 				return
 			case out <- m:
 			}
 		}
-	}(startOffset, msgs)
+
+		<-ctx.Done()
+	}(startOffset, initial)
 
 	return out, nil
 }

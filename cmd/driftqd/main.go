@@ -168,26 +168,38 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect all messages into a slice for JSON response.
-	type consumedMessage struct {
-		Offset int64  `json:"offset"`
-		Key    string `json:"key"`
-		Value  string `json:"value"`
-	}
-
-	msgs := []consumedMessage{}
-	for m := range ch {
-		msgs = append(msgs, consumedMessage{
-			Offset: m.Offset,
-			Key:    string(m.Key),
-			Value:  string(m.Value),
-		})
-	}
-
+	// We are going to stream NDJSON (one JSON object per line).
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"messages": msgs,
-	})
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	enc := json.NewEncoder(w)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m, ok := <-ch:
+			if !ok {
+				return
+			}
+
+			// One JSON object per line ==> {"offset":..., "key":..., "value":...}
+			if err := enc.Encode(map[string]any{
+				"offset": m.Offset,
+				"key":    string(m.Key),
+				"value":  string(m.Value),
+			}); err != nil {
+				return
+			}
+
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
