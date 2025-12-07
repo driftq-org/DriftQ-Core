@@ -1,3 +1,3 @@
-module github.com/BehnamAxo/DriftQ-Core
+module github.com/driftq-org/DriftQ-Core
 
 go 1.25.4

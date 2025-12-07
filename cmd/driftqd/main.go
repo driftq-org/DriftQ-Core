@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BehnamAxo/DriftQ-Core/internal/broker"
+	"github.com/driftq-org/DriftQ-Core/internal/broker"
 )
 
 type server struct {
