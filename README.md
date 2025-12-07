@@ -42,7 +42,7 @@ Producers → Broker (driftqd) → Storage (WAL) → Consumers
 ## Quick Start
 ```bash
 # Clone and build
-git clone https://github.com/BehnamAxo/driftq-core.git
+git clone https://github.com/driftq-org/driftq-core.git
 cd driftq-core
 make build
 
