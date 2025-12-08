@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"sort"
 	"sync"
 )
@@ -11,6 +12,10 @@ type Message struct {
 	Offset int64
 	Key    []byte
 	Value  []byte
+}
+
+type topicState struct {
+	partitions [][]Message
 }
 
 // Broker is the core interface for the MVP message broker
@@ -27,7 +32,7 @@ type Broker interface {
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
 	mu              sync.RWMutex
-	topics          map[string][]Message
+	topics          map[string]*topicState
 	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 }
@@ -35,7 +40,7 @@ type InMemoryBroker struct {
 // NewInMemoryBroker creates a new in-memory broker instance.
 func NewInMemoryBroker() *InMemoryBroker {
 	return &InMemoryBroker{
-		topics:          make(map[string][]Message),
+		topics:          make(map[string]*topicState),
 		consumerOffsets: make(map[string]map[string]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 	}
@@ -46,6 +51,7 @@ func (b *InMemoryBroker) CreateTopic(_ context.Context, name string, partitions 
 	if name == "" {
 		return errors.New("topic name cannot be empty")
 	}
+
 	if partitions <= 0 {
 		return errors.New("partitions must be > 0")
 	}
@@ -57,7 +63,10 @@ func (b *InMemoryBroker) CreateTopic(_ context.Context, name string, partitions 
 		return nil
 	}
 
-	b.topics[name] = nil // no messages yet
+	b.topics[name] = &topicState{
+		partitions: make([][]Message, partitions),
+	}
+
 	return nil
 }
 
@@ -74,24 +83,38 @@ func (b *InMemoryBroker) ListTopics(_ context.Context) ([]string, error) {
 	return names, nil
 }
 
+func pickPartition(key []byte, numPartitions int) int {
+	if len(key) == 0 {
+		return 0
+	}
+
+	h := fnv.New32a()
+	_, _ = h.Write(key)
+	return int(h.Sum32()) % numPartitions
+}
+
 // Produce appends a message to the given topic (in-memory only for now)
-// and delievers it to anya ctive consumers for that topic :)
+// and delivers it to any active consumers for that topic :)
 func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
 
 	b.mu.Lock()
-	messages, exists := b.topics[topic]
+	ts, exists := b.topics[topic]
 	if !exists {
 		b.mu.Unlock()
 		return errors.New("topic does not exist (create it first)")
 	}
 
-	msg.Offset = int64(len(messages))
-	b.topics[topic] = append(messages, msg)
+	numPartitions := len(ts.partitions)
+	part := pickPartition(msg.Key, numPartitions)
+	messages := ts.partitions[part]
 
-	// Snapshot of all active consumer channels for this topic!!
+	msg.Offset = int64(len(messages))
+	ts.partitions[part] = append(messages, msg)
+
+	// Notify consumers
 	var chansToNotify []chan Message
 	if groupChans, ok := b.consumerChans[topic]; ok {
 		for _, chans := range groupChans {
@@ -104,7 +127,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	// Fan-out to active consumers asynchronously.
 	go func(m Message, chans []chan Message) {
 		for _, ch := range chans {
-			// Best-effort: if a consumer is slow, Produce may block here. That's ONLY acceptable for MVP; Needs refinement later
+			// Best-effort: if a consumer is slow, Produce may block here. Note to myself: MVP: Only
 			ch <- m
 		}
 	}(msg, chansToNotify)
@@ -126,11 +149,15 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	out := make(chan Message)
 
 	b.mu.RLock()
-	messages, exists := b.topics[topic]
+	ts, exists := b.topics[topic]
 	if !exists {
 		b.mu.RUnlock()
 		return nil, errors.New("topic does not exist")
 	}
+
+	// Just for now
+	part := 0
+	messages := ts.partitions[part]
 
 	// Figure out where this consumer group should start.
 	var startOffset int64 = 0
