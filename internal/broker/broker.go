@@ -109,27 +109,26 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 		return errors.New("topic does not exist (create it first)")
 	}
 
+	// Choose partition
 	numPartitions := len(ts.partitions)
 	part := pickPartition(msg.Key, numPartitions)
 	messages := ts.partitions[part]
 
+	// GLOBAL offset
 	msg.Offset = ts.nextOffset
+	ts.nextOffset++
 	ts.partitions[part] = append(messages, msg)
 
-	// Notify consumers
 	var chansToNotify []chan Message
 	if groupChans, ok := b.consumerChans[topic]; ok {
 		for _, chans := range groupChans {
 			chansToNotify = append(chansToNotify, chans...)
 		}
 	}
-
 	b.mu.Unlock()
 
-	// Fan-out to active consumers asynchronously.
 	go func(m Message, chans []chan Message) {
 		for _, ch := range chans {
-			// Best-effort: if a consumer is slow, Produce may block here. Note to myself: MVP: Only
 			ch <- m
 		}
 	}(msg, chansToNotify)
