@@ -16,6 +16,7 @@ type Message struct {
 
 type topicState struct {
 	partitions [][]Message
+	nextOffset int64
 }
 
 // Broker is the core interface for the MVP message broker
@@ -65,6 +66,7 @@ func (b *InMemoryBroker) CreateTopic(_ context.Context, name string, partitions 
 
 	b.topics[name] = &topicState{
 		partitions: make([][]Message, partitions),
+		nextOffset: 0,
 	}
 
 	return nil
@@ -111,7 +113,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	part := pickPartition(msg.Key, numPartitions)
 	messages := ts.partitions[part]
 
-	msg.Offset = int64(len(messages))
+	msg.Offset = ts.nextOffset
 	ts.partitions[part] = append(messages, msg)
 
 	// Notify consumers
@@ -135,8 +137,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	return nil
 }
 
-// Consume returns a channel that will receive all current messages
-// for the given topic, then close. Consumer group is ignored for now.
+// Consume returns a channel that will receive all current messages for the given topic, then close. Consumer group is ignored for now.
 func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-chan Message, error) {
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
@@ -155,11 +156,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		return nil, errors.New("topic does not exist")
 	}
 
-	// Just for now
-	part := 0
-	messages := ts.partitions[part]
-
-	// Figure out where this consumer group should start.
+	// Figure out where this consumer group should start (by offset)
 	var startOffset int64 = 0
 	if groups, ok := b.consumerOffsets[topic]; ok {
 		if last, ok := groups[group]; ok {
@@ -167,16 +164,22 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		}
 	}
 
-	// Clamp / handle out-of-range.
-	if startOffset < 0 || startOffset > int64(len(messages)) {
-		startOffset = int64(len(messages)) // nothing to read
+	// Collect messages from ALL partitions.
+	var all []Message
+	for _, partMsgs := range ts.partitions {
+		all = append(all, partMsgs...)
 	}
-
-	// Copy only the slice from startOffset onward to avoid races.
-	initial := append([]Message(nil), messages[startOffset:]...)
 	b.mu.RUnlock()
 
-	// Register this consumer channel for future streaming!
+	// Filter by offset >= startOffset.
+	initial := make([]Message, 0, len(all))
+	for _, m := range all {
+		if m.Offset >= startOffset {
+			initial = append(initial, m)
+		}
+	}
+
+	// Register this consumer channel for future streaming.
 	b.mu.Lock()
 	groupChans, ok := b.consumerChans[topic]
 	if !ok {
@@ -186,10 +189,10 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	groupChans[group] = append(groupChans[group], out)
 	b.mu.Unlock()
 
-	// Goroutine we got:
+	// Goroutine:
 	//  - sends initial snapshot
-	//  - then just waits for ctx cancellation (new messages are pushed by Produce directly into `out`)
-	go func(baseOffset int64, initial []Message) {
+	//  - then just waits for ctx cancellation (new messages are pushed by Produce into `out`)
+	go func(initial []Message) {
 		defer func() {
 			// Unregister this consumer channel.
 			b.mu.Lock()
@@ -211,9 +214,8 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		// Send existing messages first.
-		for i, m := range initial {
-			m.Offset = baseOffset + int64(i)
+		// Send existing messages first (offsets already set by Produce)
+		for _, m := range initial {
 			select {
 			case <-ctx.Done():
 				return
@@ -221,8 +223,9 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			}
 		}
 
+		// Wait until client cancels (after snapshot)
 		<-ctx.Done()
-	}(startOffset, initial)
+	}(initial)
 
 	return out, nil
 }
