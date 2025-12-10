@@ -6,6 +6,8 @@ import (
 	"hash/fnv"
 	"sort"
 	"sync"
+
+	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
 type Message struct {
@@ -36,6 +38,8 @@ type InMemoryBroker struct {
 	topics          map[string]*topicState
 	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
+
+	wal storage.WAL
 }
 
 // NewInMemoryBroker creates a new in-memory broker instance.
@@ -44,6 +48,15 @@ func NewInMemoryBroker() *InMemoryBroker {
 		topics:          make(map[string]*topicState),
 		consumerOffsets: make(map[string]map[string]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
+	}
+}
+
+func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
+	return &InMemoryBroker{
+		topics:          make(map[string]*topicState),
+		consumerOffsets: make(map[string]map[string]int64),
+		consumerChans:   make(map[string]map[string][]chan Message),
+		wal:             wal,
 	}
 }
 
@@ -114,8 +127,25 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	part := pickPartition(msg.Key, numPartitions)
 	messages := ts.partitions[part]
 
-	// GLOBAL offset
+	// Assign global topic-wide offset, but DO NOT mutate state yet.
 	msg.Offset = ts.nextOffset
+
+	// --- WAL append first (if configured) ---
+	if b.wal != nil {
+		entry := storage.Entry{
+			Type:      storage.RecordTypeMessage,
+			Topic:     topic,
+			Partition: part,
+			Offset:    msg.Offset,
+			Key:       msg.Key,
+			Value:     msg.Value,
+		}
+		if err := b.wal.Append(entry); err != nil {
+			b.mu.Unlock()
+			return err
+		}
+	}
+
 	ts.nextOffset++
 	ts.partitions[part] = append(messages, msg)
 
@@ -249,15 +279,27 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 		return errors.New("topic does not exist")
 	}
 
-	// Get or create group map for this topic.
+	// If I have a WAL, log this offset so I can restore group progress on restart
+	if b.wal != nil {
+		entry := storage.Entry{
+			Type:   storage.RecordTypeOffset,
+			Topic:  topic,
+			Group:  group,
+			Offset: offset,
+		}
+
+		if err := b.wal.Append(entry); err != nil {
+			return err
+		}
+	}
+
+	// Update in-memory view of "how far this group has gotten"
 	groups, ok := b.consumerOffsets[topic]
 	if !ok {
 		groups = make(map[string]int64)
 		b.consumerOffsets[topic] = groups
 	}
 
-	// Store the last processed offset for this group.
 	groups[group] = offset
-
 	return nil
 }
