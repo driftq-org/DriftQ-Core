@@ -10,6 +10,9 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
+// Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior
+type NoopRouter struct{}
+
 // This is where I stash whatever the "brain" decided about this message. v0: super simple. I can extend this later as I learn what I actually need
 type RoutingMetadata struct {
 	Label string            `json:"label,omitempty"`
@@ -72,27 +75,38 @@ type InMemoryBroker struct {
 	router Router // If nil, "no brain configured"
 }
 
+func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
+	return RoutingDecision{
+		Label:             "",
+		TargetTopic:       "",
+		PartitionOverride: nil,
+		Meta:              make(map[string]string),
+	}, nil
+}
+
 func (b *InMemoryBroker) SetRouter(r Router) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.router = r
 }
 
-// NewInMemoryBroker creates a new in-memory broker instance.
 func NewInMemoryBroker() *InMemoryBroker {
-	return &InMemoryBroker{
-		topics:          make(map[string]*topicState),
-		consumerOffsets: make(map[string]map[string]int64),
-		consumerChans:   make(map[string]map[string][]chan Message),
-	}
+	return NewInMemoryBrokerWithWALAndRouter(nil, nil)
 }
 
+// Creates a broker that uses the given WAL but NO router
 func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
+	return NewInMemoryBrokerWithWALAndRouter(wal, nil)
+}
+
+// This now lets me plug in both durability and a brain, so passing nil for either is fine (pure in-memory/no routing)
+func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string]*topicState),
 		consumerOffsets: make(map[string]map[string]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 		wal:             wal,
+		router:          r,
 	}
 }
 
