@@ -10,15 +10,47 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
+// Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior
+type NoopRouter struct{}
+
+// This is where I stash whatever the "brain" decided about this message. v0: super simple. I can extend this later as I learn what I actually need
+type RoutingMetadata struct {
+	Label string            `json:"label,omitempty"`
+	Meta  map[string]string `json:"meta,omitempty"`
+}
+
 type Message struct {
 	Offset int64
 	Key    []byte
 	Value  []byte
+
+	Routing *RoutingMetadata
 }
 
 type topicState struct {
 	partitions [][]Message
 	nextOffset int64
+}
+
+// RoutingDecision is what the brain tells me to do with a message. For v0 I'm keeping it small
+type RoutingDecision struct {
+	// High-level label for the message. I can use this for metrics, filtering, or future policy routing
+	Label string
+
+	// If set, the brain is asking me to send this to a different topic. If empty, I keep the original topic
+	TargetTopic string
+
+	// If set, the brain wants a specific partition. If nil, I fall back to my normal. hash-based partitioning logic
+	PartitionOverride *int
+
+	// Extra metadata I want to stash with the message (embedding id, scores, and more stuff)
+	Meta map[string]string
+}
+
+// Router is the "brain" interface. Core only knows about this, not about Agno/OpenAI or whatever else I use
+type Router interface {
+	// Route looks at a message and decides how it should be labeled/routed. topic is the topic the producer asked for
+	Route(ctx context.Context, topic string, msg Message) (RoutingDecision, error)
 }
 
 // Broker is the core interface for the MVP message broker
@@ -39,24 +71,42 @@ type InMemoryBroker struct {
 	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 
-	wal storage.WAL
+	wal    storage.WAL
+	router Router // If nil, "no brain configured"
 }
 
-// NewInMemoryBroker creates a new in-memory broker instance.
+func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
+	return RoutingDecision{
+		Label:             "",
+		TargetTopic:       "",
+		PartitionOverride: nil,
+		Meta:              make(map[string]string),
+	}, nil
+}
+
+func (b *InMemoryBroker) SetRouter(r Router) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.router = r
+}
+
 func NewInMemoryBroker() *InMemoryBroker {
-	return &InMemoryBroker{
-		topics:          make(map[string]*topicState),
-		consumerOffsets: make(map[string]map[string]int64),
-		consumerChans:   make(map[string]map[string][]chan Message),
-	}
+	return NewInMemoryBrokerWithWALAndRouter(nil, nil)
 }
 
+// Creates a broker that uses the given WAL but NO router
 func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
+	return NewInMemoryBrokerWithWALAndRouter(wal, nil)
+}
+
+// This now lets me plug in both durability and a brain, so passing nil for either is fine (pure in-memory/no routing)
+func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string]*topicState),
 		consumerOffsets: make(map[string]map[string]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 		wal:             wal,
+		router:          r,
 	}
 }
 
