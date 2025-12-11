@@ -21,6 +21,12 @@ type server struct {
 	broker broker.Broker
 }
 
+type ProduceRequest struct {
+	Topic string `json:"topic"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 type TestRouter struct{}
 
 func main() {
@@ -142,27 +148,59 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	w.Header().Set("Content-Type", "application/json")
 
-	topic := r.URL.Query().Get("topic")
-	key := r.URL.Query().Get("key")
-	value := r.URL.Query().Get("value")
+	var req ProduceRequest
 
-	if topic == "" || value == "" {
-		http.Error(w, "topic and value are required", http.StatusBadRequest)
+	// Try to decode JSON body first
+	if r.Body != nil {
+		defer r.Body.Close()
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	// Fallback to query params if JSON didn't provide these fields!
+	if req.Topic == "" {
+		req.Topic = r.URL.Query().Get("topic")
+	}
+
+	if req.Key == "" {
+		req.Key = r.URL.Query().Get("key")
+	}
+
+	if req.Value == "" {
+		req.Value = r.URL.Query().Get("value")
+	}
+
+	if req.Topic == "" {
+		http.Error(w, "topic is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Key == "" {
+		http.Error(w, "key is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Value == "" {
+		http.Error(w, "value is required", http.StatusBadRequest)
 		return
 	}
 
 	msg := broker.Message{
-		Key:   []byte(key),
-		Value: []byte(value),
+		Key:   []byte(req.Key),
+		Value: []byte(req.Value),
 	}
 
-	if err := s.broker.Produce(ctx, topic, msg); err != nil {
+	err := s.broker.Produce(ctx, req.Topic, msg)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	_, _ = w.Write([]byte("produced\n"))
+	// Respond JSON
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+	})
 }
 
 func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
