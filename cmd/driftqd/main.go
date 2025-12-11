@@ -21,6 +21,8 @@ type server struct {
 	broker broker.Broker
 }
 
+type TestRouter struct{}
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	flag.Parse()
@@ -41,6 +43,7 @@ func main() {
 		log.Fatalf("failed to replay WAL: %v", err)
 	}
 
+	b.SetRouter(TestRouter{})
 	s := &server{broker: b}
 
 	mux := http.NewServeMux()
@@ -203,12 +206,21 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// One JSON object per line ==> {"offset":..., "key":..., "value":...}
-			if err := enc.Encode(map[string]any{
+			obj := map[string]any{
 				"offset": m.Offset,
 				"key":    string(m.Key),
 				"value":  string(m.Value),
-			}); err != nil {
+			}
+
+			// If routing info exists, include it.
+			if m.Routing != nil {
+				obj["routing"] = map[string]any{
+					"label": m.Routing.Label,
+					"meta":  m.Routing.Meta,
+				}
+			}
+
+			if err := enc.Encode(obj); err != nil {
 				return
 			}
 
@@ -246,4 +258,11 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = w.Write([]byte("acked\n"))
+}
+
+func (TestRouter) Route(_ context.Context, topic string, msg broker.Message) (broker.RoutingDecision, error) {
+	return broker.RoutingDecision{
+		Label: "test-label",
+		Meta:  map[string]string{"source": "router"},
+	}, nil
 }

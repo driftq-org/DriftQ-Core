@@ -146,6 +146,15 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 				Value:  e.Value,
 				Offset: e.Offset,
 			}
+
+			// Restore routing metadata if present.
+			if e.RoutingLabel != "" || len(e.RoutingMeta) > 0 {
+				m.Routing = &RoutingMetadata{
+					Label: e.RoutingLabel,
+					Meta:  e.RoutingMeta,
+				}
+			}
+
 			ts.partitions[e.Partition] = append(ts.partitions[e.Partition], m)
 
 			if e.Offset >= ts.nextOffset {
@@ -225,6 +234,22 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 		return errors.New("topic cannot be empty")
 	}
 
+	// If I have a router, let it take a look at this message before I do anything
+	// This won't affect routing yet — I just stash whatever metadata it returns
+	if b.router != nil {
+		decision, err := b.router.Route(context.Background(), topic, msg)
+		if err == nil {
+			// Attach whatever the brain said here
+			msg.Routing = &RoutingMetadata{
+				Label: decision.Label,
+				Meta:  decision.Meta,
+			}
+		} else {
+			// Note to myself:
+			// if the router blows up, I just ignore it for now, because v0 is not strict about routing failures.
+		}
+	}
+
 	b.mu.Lock()
 	ts, exists := b.topics[topic]
 	if !exists {
@@ -249,7 +274,16 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 			Offset:    msg.Offset,
 			Key:       msg.Key,
 			Value:     msg.Value,
+
+			RoutingLabel: "",
+			RoutingMeta:  nil,
 		}
+
+		if msg.Routing != nil {
+			entry.RoutingLabel = msg.Routing.Label
+			entry.RoutingMeta = msg.Routing.Meta
+		}
+
 		if err := b.wal.Append(entry); err != nil {
 			b.mu.Unlock()
 			return err
