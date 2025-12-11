@@ -29,6 +29,9 @@ type Entry struct {
 
 	Key   []byte `json:"key,omitempty"`
 	Value []byte `json:"value,omitempty"`
+
+	RoutingLabel string
+	RoutingMeta  map[string]string
 }
 
 type WAL interface {
