@@ -64,7 +64,7 @@ func main() {
 		Addr:         *addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 0, // or 10 * time.Second
 	}
 
 	log.Printf("DriftQ broker starting on %s\n", *addr)

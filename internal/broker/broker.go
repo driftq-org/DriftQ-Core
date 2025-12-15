@@ -68,7 +68,7 @@ type Broker interface {
 type InMemoryBroker struct {
 	mu              sync.RWMutex
 	topics          map[string]*topicState
-	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
+	consumerOffsets map[string]map[string]map[int]int64  // topic -> group -> offset -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 
 	rrCursor map[string]map[string]int
@@ -105,7 +105,7 @@ func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
 func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string]*topicState),
-		consumerOffsets: make(map[string]map[string]int64),
+		consumerOffsets: make(map[string]map[string]map[int]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 		rrCursor:        make(map[string]map[string]int),
 		wal:             wal,
@@ -165,15 +165,18 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			}
 
 		case storage.RecordTypeOffset:
-			// Restore "how far this group got" for this topic.
 			if _, ok := b.consumerOffsets[e.Topic]; !ok {
-				b.consumerOffsets[e.Topic] = make(map[string]int64)
+				b.consumerOffsets[e.Topic] = make(map[string]map[int]int64)
 			}
 
-			if cur, ok := b.consumerOffsets[e.Topic][e.Group]; !ok || e.Offset > cur {
-				b.consumerOffsets[e.Topic][e.Group] = e.Offset
+			if _, ok := b.consumerOffsets[e.Topic][e.Group]; !ok {
+				b.consumerOffsets[e.Topic][e.Group] = make(map[int]int64)
 			}
 
+			cur, ok := b.consumerOffsets[e.Topic][e.Group][e.Partition]
+			if !ok || e.Offset > cur {
+				b.consumerOffsets[e.Topic][e.Group][e.Partition] = e.Offset
+			}
 		default:
 			// For now I just ignore unknown record types but this is a TODO for the future
 		}
@@ -351,11 +354,12 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	// Figure out where this consumer group should start (by offset)
 	var startOffset int64 = 0
 	if groups, ok := b.consumerOffsets[topic]; ok {
-		if last, ok := groups[group]; ok {
-			startOffset = last + 1 // resume from next message after last acked
+		if parts, ok := groups[group]; ok {
+			if last, ok := parts[0]; ok {
+				startOffset = last + 1 // This is TEMP: partition 0 only
+			}
 		}
 	}
-
 	// Collect messages from ALL partitions.
 	var all []Message
 	for _, partMsgs := range ts.partitions {
@@ -471,13 +475,20 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 		}
 	}
 
-	// Update in-memory view of "how far this group has gotten"
 	groups, ok := b.consumerOffsets[topic]
 	if !ok {
-		groups = make(map[string]int64)
+		groups = make(map[string]map[int]int64)
 		b.consumerOffsets[topic] = groups
 	}
 
-	groups[group] = offset
+	parts, ok := groups[group]
+	if !ok {
+		parts = make(map[int]int64)
+		groups[group] = parts
+	}
+
+	// This is TEMP: partition 0 only (until I add partition-aware ack)
+	// This is OK for now because /ack doesn't inlcude a partition yet and my Consume currently merges partitions anyway
+	parts[0] = offset
 	return nil
 }
