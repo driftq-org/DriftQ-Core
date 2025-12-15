@@ -71,6 +71,8 @@ type InMemoryBroker struct {
 	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
 
+	rrCursor map[string]map[string]int
+
 	wal    storage.WAL
 	router Router // If nil, "no brain configured"
 }
@@ -105,6 +107,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		topics:          make(map[string]*topicState),
 		consumerOffsets: make(map[string]map[string]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
+		rrCursor:        make(map[string]map[string]int),
 		wal:             wal,
 		router:          r,
 	}
@@ -294,16 +297,32 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	ts.partitions[part] = append(messages, msg)
 
 	var chansToNotify []chan Message
+
 	if groupChans, ok := b.consumerChans[topic]; ok {
-		for _, chans := range groupChans {
-			chansToNotify = append(chansToNotify, chans...)
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
+		}
+
+		for group, chans := range groupChans {
+			if len(chans) == 0 {
+				continue
+			}
+			idx := b.rrCursor[topic][group] % len(chans)
+			b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+
+			chansToNotify = append(chansToNotify, chans[idx])
 		}
 	}
+
 	b.mu.Unlock()
 
 	go func(m Message, chans []chan Message) {
 		for _, ch := range chans {
-			ch <- m
+			// This keeps the app from crashing if a consumer disconnects mid-send
+			func() {
+				defer func() { _ = recover() }()
+				ch <- m
+			}()
 		}
 	}(msg, chansToNotify)
 
