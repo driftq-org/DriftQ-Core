@@ -61,7 +61,7 @@ type Broker interface {
 	Produce(ctx context.Context, topic string, msg Message) error
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
 
-	Ack(ctx context.Context, topic, group string, offset int64) error
+	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
 }
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
@@ -441,7 +441,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	return out, nil
 }
 
-func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int64) error {
+func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition int, offset int64) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
@@ -464,10 +464,11 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 	// If I have a WAL, log this offset so I can restore group progress on restart
 	if b.wal != nil {
 		entry := storage.Entry{
-			Type:   storage.RecordTypeOffset,
-			Topic:  topic,
-			Group:  group,
-			Offset: offset,
+			Type:      storage.RecordTypeOffset,
+			Topic:     topic,
+			Group:     group,
+			Partition: partition,
+			Offset:    offset,
 		}
 
 		if err := b.wal.Append(entry); err != nil {
@@ -487,8 +488,6 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 		groups[group] = parts
 	}
 
-	// This is TEMP: partition 0 only (until I add partition-aware ack)
-	// This is OK for now because /ack doesn't inlcude a partition yet and my Consume currently merges partitions anyway
-	parts[0] = offset
+	parts[partition] = offset
 	return nil
 }
