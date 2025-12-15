@@ -378,6 +378,9 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		groupChans = make(map[string][]chan Message)
 		b.consumerChans[topic] = groupChans
 	}
+
+	sendInitial := len(groupChans[group]) == 0
+
 	groupChans[group] = append(groupChans[group], out)
 	b.mu.Unlock()
 
@@ -406,12 +409,14 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		// Send existing messages first (offsets already set by Produce)
-		for _, m := range initial {
-			select {
-			case <-ctx.Done():
-				return
-			case out <- m:
+		if sendInitial {
+			// Send existing messages first (offsets already set by Produce)
+			for _, m := range initial {
+				select {
+				case <-ctx.Done():
+					return
+				case out <- m:
+				}
 			}
 		}
 
