@@ -385,11 +385,11 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	b.mu.Unlock()
 
 	// Goroutine:
-	//  - sends initial snapshot
+	//  - sends initial snapshot (optional)
 	//  - then just waits for ctx cancellation (new messages are pushed by Produce into `out`)
-	go func(initial []Message) {
+	go func(initial []Message, sendInitial bool) {
 		defer func() {
-			// Unregister this consumer channel.
+			// Unregister this consumer channel
 			b.mu.Lock()
 			if groupChans, ok := b.consumerChans[topic]; ok {
 				chans := groupChans[group]
@@ -400,8 +400,18 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 					}
 				}
 
+				// If no consumers left for this group, delete the group entry
 				if len(groupChans[group]) == 0 {
 					delete(groupChans, group)
+				}
+
+				if cursors, ok := b.rrCursor[topic]; ok {
+					if _, ok := groupChans[group]; !ok {
+						// Note: group entry deleted => no consumers
+						delete(cursors, group)
+					} else if cur, ok := cursors[group]; ok && cur >= len(groupChans[group]) {
+						cursors[group] = cur % len(groupChans[group])
+					}
 				}
 			}
 			b.mu.Unlock()
@@ -422,7 +432,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 		// Wait until client cancels (after snapshot)
 		<-ctx.Done()
-	}(initial)
+	}(initial, sendInitial)
 
 	return out, nil
 }
