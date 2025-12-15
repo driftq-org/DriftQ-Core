@@ -207,9 +207,10 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			}
 
 			obj := map[string]any{
-				"offset": m.Offset,
-				"key":    string(m.Key),
-				"value":  string(m.Value),
+				"partition": m.Partition,
+				"offset":    m.Offset,
+				"key":       string(m.Key),
+				"value":     string(m.Value),
 			}
 
 			// If routing info exists, include it.

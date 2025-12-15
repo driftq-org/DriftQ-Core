@@ -20,11 +20,11 @@ type RoutingMetadata struct {
 }
 
 type Message struct {
-	Offset int64
-	Key    []byte
-	Value  []byte
-
-	Routing *RoutingMetadata
+	Offset    int64
+	Partition int
+	Key       []byte
+	Value     []byte
+	Routing   *RoutingMetadata
 }
 
 type topicState struct {
@@ -145,9 +145,10 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			}
 
 			m := Message{
-				Key:    e.Key,
-				Value:  e.Value,
-				Offset: e.Offset,
+				Key:       e.Key,
+				Partition: e.Partition,
+				Value:     e.Value,
+				Offset:    e.Offset,
 			}
 
 			// Restore routing metadata if present.
@@ -270,6 +271,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 	// Assign global topic-wide offset, but DO NOT mutate state yet.
 	msg.Offset = ts.nextOffset
+	msg.Partition = part
 
 	// --- WAL append first (if configured) ---
 	if b.wal != nil {
