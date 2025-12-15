@@ -346,6 +346,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 	out := make(chan Message)
 
+	// Build initial snapshot PER PARTITION based on last-acked offsets.
 	b.mu.RLock()
 	ts, exists := b.topics[topic]
 	if !exists {
@@ -353,29 +354,33 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		return nil, errors.New("topic does not exist")
 	}
 
-	// Figure out where this consumer group should start (by offset)
-	var startOffset int64 = 0
-	if groups, ok := b.consumerOffsets[topic]; ok {
-		if parts, ok := groups[group]; ok {
-			if last, ok := parts[0]; ok {
-				startOffset = last + 1 // This is TEMP: partition 0 only
+	var lastAckByPart map[int]int64
+	if byTopic, ok := b.consumerOffsets[topic]; ok {
+		if byGroup, ok := byTopic[group]; ok {
+			lastAckByPart = byGroup // map[int]int64 (partition -> last acked offset)
+		}
+	}
+
+	initial := make([]Message, 0)
+	for p, partMsgs := range ts.partitions {
+		last := int64(-1)
+		if lastAckByPart != nil {
+			if v, ok := lastAckByPart[p]; ok {
+				last = v
+			}
+		}
+
+		for _, m := range partMsgs {
+			// ***** Only send messages strictly after what was acked for THIS partition
+			if m.Offset > last {
+				initial = append(initial, m)
 			}
 		}
 	}
-	// Collect messages from ALL partitions.
-	var all []Message
-	for _, partMsgs := range ts.partitions {
-		all = append(all, partMsgs...)
-	}
 	b.mu.RUnlock()
 
-	// Filter by offset >= startOffset.
-	initial := make([]Message, 0, len(all))
-	for _, m := range all {
-		if m.Offset >= startOffset {
-			initial = append(initial, m)
-		}
-	}
+	// Stable ordering across partitions by global offset.
+	sort.Slice(initial, func(i, j int) bool { return initial[i].Offset < initial[j].Offset })
 
 	// Register this consumer channel for future streaming.
 	b.mu.Lock()
@@ -386,7 +391,6 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	}
 
 	sendInitial := len(groupChans[group]) == 0
-
 	groupChans[group] = append(groupChans[group], out)
 	b.mu.Unlock()
 
@@ -426,7 +430,6 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		}()
 
 		if sendInitial {
-			// Send existing messages first (offsets already set by Produce)
 			for _, m := range initial {
 				select {
 				case <-ctx.Done():
@@ -436,7 +439,6 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			}
 		}
 
-		// Wait until client cancels (after snapshot)
 		<-ctx.Done()
 	}(initial, sendInitial)
 
