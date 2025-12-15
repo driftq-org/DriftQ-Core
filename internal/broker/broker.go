@@ -20,11 +20,11 @@ type RoutingMetadata struct {
 }
 
 type Message struct {
-	Offset int64
-	Key    []byte
-	Value  []byte
-
-	Routing *RoutingMetadata
+	Offset    int64
+	Partition int
+	Key       []byte
+	Value     []byte
+	Routing   *RoutingMetadata
 }
 
 type topicState struct {
@@ -61,15 +61,17 @@ type Broker interface {
 	Produce(ctx context.Context, topic string, msg Message) error
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
 
-	Ack(ctx context.Context, topic, group string, offset int64) error
+	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
 }
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
 	mu              sync.RWMutex
 	topics          map[string]*topicState
-	consumerOffsets map[string]map[string]int64          // topic -> group -> offset
+	consumerOffsets map[string]map[string]map[int]int64  // topic -> group -> offset -> offset
 	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
+
+	rrCursor map[string]map[string]int
 
 	wal    storage.WAL
 	router Router // If nil, "no brain configured"
@@ -103,8 +105,9 @@ func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
 func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
 		topics:          make(map[string]*topicState),
-		consumerOffsets: make(map[string]map[string]int64),
+		consumerOffsets: make(map[string]map[string]map[int]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
+		rrCursor:        make(map[string]map[string]int),
 		wal:             wal,
 		router:          r,
 	}
@@ -142,9 +145,10 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			}
 
 			m := Message{
-				Key:    e.Key,
-				Value:  e.Value,
-				Offset: e.Offset,
+				Key:       e.Key,
+				Partition: e.Partition,
+				Value:     e.Value,
+				Offset:    e.Offset,
 			}
 
 			// Restore routing metadata if present.
@@ -162,15 +166,18 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			}
 
 		case storage.RecordTypeOffset:
-			// Restore "how far this group got" for this topic.
 			if _, ok := b.consumerOffsets[e.Topic]; !ok {
-				b.consumerOffsets[e.Topic] = make(map[string]int64)
+				b.consumerOffsets[e.Topic] = make(map[string]map[int]int64)
 			}
 
-			if cur, ok := b.consumerOffsets[e.Topic][e.Group]; !ok || e.Offset > cur {
-				b.consumerOffsets[e.Topic][e.Group] = e.Offset
+			if _, ok := b.consumerOffsets[e.Topic][e.Group]; !ok {
+				b.consumerOffsets[e.Topic][e.Group] = make(map[int]int64)
 			}
 
+			cur, ok := b.consumerOffsets[e.Topic][e.Group][e.Partition]
+			if !ok || e.Offset > cur {
+				b.consumerOffsets[e.Topic][e.Group][e.Partition] = e.Offset
+			}
 		default:
 			// For now I just ignore unknown record types but this is a TODO for the future
 		}
@@ -264,6 +271,7 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 	// Assign global topic-wide offset, but DO NOT mutate state yet.
 	msg.Offset = ts.nextOffset
+	msg.Partition = part
 
 	// --- WAL append first (if configured) ---
 	if b.wal != nil {
@@ -294,16 +302,32 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	ts.partitions[part] = append(messages, msg)
 
 	var chansToNotify []chan Message
+
 	if groupChans, ok := b.consumerChans[topic]; ok {
-		for _, chans := range groupChans {
-			chansToNotify = append(chansToNotify, chans...)
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
+		}
+
+		for group, chans := range groupChans {
+			if len(chans) == 0 {
+				continue
+			}
+			idx := b.rrCursor[topic][group] % len(chans)
+			b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+
+			chansToNotify = append(chansToNotify, chans[idx])
 		}
 	}
+
 	b.mu.Unlock()
 
 	go func(m Message, chans []chan Message) {
 		for _, ch := range chans {
-			ch <- m
+			// This keeps the app from crashing if a consumer disconnects mid-send
+			func() {
+				defer func() { _ = recover() }()
+				ch <- m
+			}()
 		}
 	}(msg, chansToNotify)
 
@@ -322,6 +346,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 	out := make(chan Message)
 
+	// Build initial snapshot PER PARTITION based on last-acked offsets.
 	b.mu.RLock()
 	ts, exists := b.topics[topic]
 	if !exists {
@@ -329,28 +354,33 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		return nil, errors.New("topic does not exist")
 	}
 
-	// Figure out where this consumer group should start (by offset)
-	var startOffset int64 = 0
-	if groups, ok := b.consumerOffsets[topic]; ok {
-		if last, ok := groups[group]; ok {
-			startOffset = last + 1 // resume from next message after last acked
+	var lastAckByPart map[int]int64
+	if byTopic, ok := b.consumerOffsets[topic]; ok {
+		if byGroup, ok := byTopic[group]; ok {
+			lastAckByPart = byGroup // map[int]int64 (partition -> last acked offset)
 		}
 	}
 
-	// Collect messages from ALL partitions.
-	var all []Message
-	for _, partMsgs := range ts.partitions {
-		all = append(all, partMsgs...)
+	initial := make([]Message, 0)
+	for p, partMsgs := range ts.partitions {
+		last := int64(-1)
+		if lastAckByPart != nil {
+			if v, ok := lastAckByPart[p]; ok {
+				last = v
+			}
+		}
+
+		for _, m := range partMsgs {
+			// ***** Only send messages strictly after what was acked for THIS partition
+			if m.Offset > last {
+				initial = append(initial, m)
+			}
+		}
 	}
 	b.mu.RUnlock()
 
-	// Filter by offset >= startOffset.
-	initial := make([]Message, 0, len(all))
-	for _, m := range all {
-		if m.Offset >= startOffset {
-			initial = append(initial, m)
-		}
-	}
+	// Stable ordering across partitions by global offset.
+	sort.Slice(initial, func(i, j int) bool { return initial[i].Offset < initial[j].Offset })
 
 	// Register this consumer channel for future streaming.
 	b.mu.Lock()
@@ -359,15 +389,17 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		groupChans = make(map[string][]chan Message)
 		b.consumerChans[topic] = groupChans
 	}
+
+	sendInitial := len(groupChans[group]) == 0
 	groupChans[group] = append(groupChans[group], out)
 	b.mu.Unlock()
 
 	// Goroutine:
-	//  - sends initial snapshot
+	//  - sends initial snapshot (optional)
 	//  - then just waits for ctx cancellation (new messages are pushed by Produce into `out`)
-	go func(initial []Message) {
+	go func(initial []Message, sendInitial bool) {
 		defer func() {
-			// Unregister this consumer channel.
+			// Unregister this consumer channel
 			b.mu.Lock()
 			if groupChans, ok := b.consumerChans[topic]; ok {
 				chans := groupChans[group]
@@ -378,8 +410,18 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 					}
 				}
 
+				// If no consumers left for this group, delete the group entry
 				if len(groupChans[group]) == 0 {
 					delete(groupChans, group)
+				}
+
+				if cursors, ok := b.rrCursor[topic]; ok {
+					if _, ok := groupChans[group]; !ok {
+						// Note: group entry deleted => no consumers
+						delete(cursors, group)
+					} else if cur, ok := cursors[group]; ok && cur >= len(groupChans[group]) {
+						cursors[group] = cur % len(groupChans[group])
+					}
 				}
 			}
 			b.mu.Unlock()
@@ -387,23 +429,23 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		// Send existing messages first (offsets already set by Produce)
-		for _, m := range initial {
-			select {
-			case <-ctx.Done():
-				return
-			case out <- m:
+		if sendInitial {
+			for _, m := range initial {
+				select {
+				case <-ctx.Done():
+					return
+				case out <- m:
+				}
 			}
 		}
 
-		// Wait until client cancels (after snapshot)
 		<-ctx.Done()
-	}(initial)
+	}(initial, sendInitial)
 
 	return out, nil
 }
 
-func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int64) error {
+func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition int, offset int64) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
@@ -426,10 +468,11 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 	// If I have a WAL, log this offset so I can restore group progress on restart
 	if b.wal != nil {
 		entry := storage.Entry{
-			Type:   storage.RecordTypeOffset,
-			Topic:  topic,
-			Group:  group,
-			Offset: offset,
+			Type:      storage.RecordTypeOffset,
+			Topic:     topic,
+			Group:     group,
+			Partition: partition,
+			Offset:    offset,
 		}
 
 		if err := b.wal.Append(entry); err != nil {
@@ -437,13 +480,18 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, offset int6
 		}
 	}
 
-	// Update in-memory view of "how far this group has gotten"
 	groups, ok := b.consumerOffsets[topic]
 	if !ok {
-		groups = make(map[string]int64)
+		groups = make(map[string]map[int]int64)
 		b.consumerOffsets[topic] = groups
 	}
 
-	groups[group] = offset
+	parts, ok := groups[group]
+	if !ok {
+		parts = make(map[int]int64)
+		groups[group] = parts
+	}
+
+	parts[partition] = offset
 	return nil
 }

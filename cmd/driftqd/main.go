@@ -64,7 +64,7 @@ func main() {
 		Addr:         *addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 0, // or 10 * time.Second
 	}
 
 	log.Printf("DriftQ broker starting on %s\n", *addr)
@@ -207,9 +207,10 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			}
 
 			obj := map[string]any{
-				"offset": m.Offset,
-				"key":    string(m.Key),
-				"value":  string(m.Value),
+				"partition": m.Partition,
+				"offset":    m.Offset,
+				"key":       string(m.Key),
+				"value":     string(m.Value),
 			}
 
 			// If routing info exists, include it.
@@ -240,6 +241,17 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	topic := r.URL.Query().Get("topic")
 	group := r.URL.Query().Get("group")
 	offsetStr := r.URL.Query().Get("offset")
+	partitionStr := r.URL.Query().Get("partition")
+
+	if partitionStr == "" {
+		partitionStr = "0" // default ONLY for now
+	}
+
+	partition, err := strconv.Atoi(partitionStr)
+	if err != nil || partition < 0 {
+		http.Error(w, "invalid partition", http.StatusBadRequest)
+		return
+	}
 
 	if topic == "" || group == "" || offsetStr == "" {
 		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
@@ -252,7 +264,7 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.broker.Ack(ctx, topic, group, offset); err != nil {
+	if err := s.broker.Ack(ctx, topic, group, partition, offset); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
