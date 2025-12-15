@@ -264,7 +264,6 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// if err := s.broker.Ack(ctx, topic, group, offset); err != nil {
 	if err := s.broker.Ack(ctx, topic, group, partition, offset); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
