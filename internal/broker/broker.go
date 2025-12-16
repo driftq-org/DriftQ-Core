@@ -66,12 +66,25 @@ type Broker interface {
 
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
-	mu              sync.RWMutex
-	topics          map[string]*topicState
-	consumerOffsets map[string]map[string]map[int]int64  // topic -> group -> offset -> offset
-	consumerChans   map[string]map[string][]chan Message // topic -> group -> list of chans
+	mu     sync.RWMutex
+	topics map[string]*topicState
+
+	// topic -> group -> offset -> offset
+	consumerOffsets map[string]map[string]map[int]int64
+
+	// topic -> group -> list of chans
+	consumerChans map[string]map[string][]chan Message
 
 	rrCursor map[string]map[string]int
+
+	// max unacked messages allowed per (topic, group, partition)
+	maxInFlight int
+
+	// topic -> group -> partition -> set(offset) of currently in-flight (delivered but not acked)
+	inFlight map[string]map[string]map[int]map[int64]struct{}
+
+	// topic -> group -> partition -> next index in ts.partitions[partition] to attempt dispatch
+	nextIndex map[string]map[string]map[int]int
 
 	wal    storage.WAL
 	router Router // If nil, "no brain configured"
@@ -108,6 +121,9 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		consumerOffsets: make(map[string]map[string]map[int]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 		rrCursor:        make(map[string]map[string]int),
+		maxInFlight:     2, // for testing, later can raise
+		inFlight:        make(map[string]map[string]map[int]map[int64]struct{}),
+		nextIndex:       make(map[string]map[string]map[int]int),
 		wal:             wal,
 		router:          r,
 	}
