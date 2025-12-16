@@ -95,6 +95,9 @@ type InMemoryBroker struct {
 
 	wal    storage.WAL
 	router Router // If nil, "no brain configured"
+
+	ackTimeout    time.Duration
+	redeliverTick time.Duration
 }
 
 func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
@@ -133,6 +136,8 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		nextIndex:       make(map[string]map[string]map[int]int),
 		wal:             wal,
 		router:          r,
+		ackTimeout:      2 * time.Second,
+		redeliverTick:   250 * time.Millisecond,
 	}
 }
 
@@ -608,6 +613,67 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 					defer func() { _ = recover() }()
 					ch <- m
 				}(ch, m)
+			}
+		}
+	}
+}
+
+func (b *InMemoryBroker) StartRedeliveryLoop(ctx context.Context) {
+	t := time.NewTicker(b.redeliverTick)
+	go func() {
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				b.mu.Lock()
+				b.redeliverExpiredLocked()
+				b.mu.Unlock()
+			}
+		}
+	}()
+}
+
+func (b *InMemoryBroker) redeliverExpiredLocked() {
+	now := time.Now()
+
+	for topic, byGroup := range b.inFlight {
+		groupChans, ok := b.consumerChans[topic]
+		if !ok {
+			continue
+		}
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
+		}
+
+		for group, byPart := range byGroup {
+			chans := groupChans[group]
+			if len(chans) == 0 {
+				continue
+			}
+
+			for _, inflight := range byPart {
+				for _, e := range inflight {
+					if now.Sub(e.SentAt) < b.ackTimeout {
+						continue
+					}
+
+					// pick one consumer in the group (round-robin!)
+					idx := b.rrCursor[topic][group] % len(chans)
+					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+					ch := chans[idx]
+
+					// update inflight bookkeeping
+					e.SentAt = now
+					e.Attempts++
+
+					m := e.Msg
+					go func(ch chan Message, m Message) {
+						defer func() { _ = recover() }()
+						ch <- m
+					}(ch, m)
+				}
 			}
 		}
 	}
