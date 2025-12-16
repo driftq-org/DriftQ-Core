@@ -337,58 +337,31 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 	out := make(chan Message)
 
-	// Build initial snapshot PER PARTITION based on last-acked offsets.
-	b.mu.RLock()
-	ts, exists := b.topics[topic]
-	if !exists {
-		b.mu.RUnlock()
+	// Register this consumer channel for streaming, and kick backlog dispatch through dispatchLocked() so inFlight entries are created (required for redelivery)
+	b.mu.Lock()
+	if _, exists := b.topics[topic]; !exists {
+		b.mu.Unlock()
 		return nil, errors.New("topic does not exist")
 	}
 
-	var lastAckByPart map[int]int64
-	if byTopic, ok := b.consumerOffsets[topic]; ok {
-		if byGroup, ok := byTopic[group]; ok {
-			lastAckByPart = byGroup // map[int]int64 (partition -> last acked offset)
-		}
-	}
-
-	initial := make([]Message, 0)
-	for p, partMsgs := range ts.partitions {
-		last := int64(-1)
-		if lastAckByPart != nil {
-			if v, ok := lastAckByPart[p]; ok {
-				last = v
-			}
-		}
-
-		for _, m := range partMsgs {
-			// ***** Only send messages strictly after what was acked for THIS partition
-			if m.Offset > last {
-				initial = append(initial, m)
-			}
-		}
-	}
-	b.mu.RUnlock()
-
-	// Stable ordering across partitions by global offset.
-	sort.Slice(initial, func(i, j int) bool { return initial[i].Offset < initial[j].Offset })
-
-	// Register this consumer channel for future streaming.
-	b.mu.Lock()
 	groupChans, ok := b.consumerChans[topic]
 	if !ok {
 		groupChans = make(map[string][]chan Message)
 		b.consumerChans[topic] = groupChans
 	}
 
-	sendInitial := len(groupChans[group]) == 0
+	// If this is the FIRST consumer for this group, kick backlog dispatch
+	kick := len(groupChans[group]) == 0
+
 	groupChans[group] = append(groupChans[group], out)
+
+	if kick {
+		b.dispatchLocked(topic)
+	}
 	b.mu.Unlock()
 
-	// Goroutine:
-	//  - sends initial snapshot (optional)
-	//  - then just waits for ctx cancellation (new messages are pushed by Produce into `out`)
-	go func(initial []Message, sendInitial bool) {
+	// Wait for ctx cancel; messages are pushed by dispatchLocked/Produce/redelivery loop.
+	go func() {
 		defer func() {
 			// Unregister this consumer channel
 			b.mu.Lock()
@@ -406,9 +379,9 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 					delete(groupChans, group)
 				}
 
+				// Keep rrCursor sane
 				if cursors, ok := b.rrCursor[topic]; ok {
 					if _, ok := groupChans[group]; !ok {
-						// Note: group entry deleted => no consumers
 						delete(cursors, group)
 					} else if cur, ok := cursors[group]; ok && cur >= len(groupChans[group]) {
 						cursors[group] = cur % len(groupChans[group])
@@ -420,18 +393,8 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		if sendInitial {
-			for _, m := range initial {
-				select {
-				case <-ctx.Done():
-					return
-				case out <- m:
-				}
-			}
-		}
-
 		<-ctx.Done()
-	}(initial, sendInitial)
+	}()
 
 	return out, nil
 }
