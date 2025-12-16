@@ -121,7 +121,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		consumerOffsets: make(map[string]map[string]map[int]int64),
 		consumerChans:   make(map[string]map[string][]chan Message),
 		rrCursor:        make(map[string]map[string]int),
-		maxInFlight:     2, // for testing, later can raise
+		maxInFlight:     2, // for testing, later can raise if needed!
 		inFlight:        make(map[string]map[string]map[int]map[int64]struct{}),
 		nextIndex:       make(map[string]map[string]map[int]int),
 		wal:             wal,
@@ -250,8 +250,6 @@ func pickPartition(key []byte, numPartitions int) int {
 	return int(h.Sum32()) % numPartitions
 }
 
-// Produce appends a message to the given topic (in-memory only for now)
-// and delivers it to any active consumers for that topic :)
 func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
@@ -262,14 +260,10 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	if b.router != nil {
 		decision, err := b.router.Route(context.Background(), topic, msg)
 		if err == nil {
-			// Attach whatever the brain said here
 			msg.Routing = &RoutingMetadata{
 				Label: decision.Label,
 				Meta:  decision.Meta,
 			}
-		} else {
-			// Note to myself:
-			// if the router blows up, I just ignore it for now, because v0 is not strict about routing failures.
 		}
 	}
 
@@ -280,16 +274,13 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 		return errors.New("topic does not exist (create it first)")
 	}
 
-	// Choose partition
 	numPartitions := len(ts.partitions)
 	part := pickPartition(msg.Key, numPartitions)
-	messages := ts.partitions[part]
 
-	// Assign global topic-wide offset, but DO NOT mutate state yet.
 	msg.Offset = ts.nextOffset
 	msg.Partition = part
 
-	// --- WAL append first (if configured) ---
+	// WAL append first (if configured)
 	if b.wal != nil {
 		entry := storage.Entry{
 			Type:      storage.RecordTypeMessage,
@@ -298,9 +289,6 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 			Offset:    msg.Offset,
 			Key:       msg.Key,
 			Value:     msg.Value,
-
-			RoutingLabel: "",
-			RoutingMeta:  nil,
 		}
 
 		if msg.Routing != nil {
@@ -314,39 +302,14 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 		}
 	}
 
+	// Commit to in-memory state
 	ts.nextOffset++
-	ts.partitions[part] = append(messages, msg)
+	ts.partitions[part] = append(ts.partitions[part], msg)
 
-	var chansToNotify []chan Message
-
-	if groupChans, ok := b.consumerChans[topic]; ok {
-		if _, ok := b.rrCursor[topic]; !ok {
-			b.rrCursor[topic] = make(map[string]int)
-		}
-
-		for group, chans := range groupChans {
-			if len(chans) == 0 {
-				continue
-			}
-			idx := b.rrCursor[topic][group] % len(chans)
-			b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-
-			chansToNotify = append(chansToNotify, chans[idx])
-		}
-	}
+	// NEW: deliver what we can, respecting maxInFlight
+	b.dispatchLocked(topic)
 
 	b.mu.Unlock()
-
-	go func(m Message, chans []chan Message) {
-		for _, ch := range chans {
-			// This keeps the app from crashing if a consumer disconnects mid-send
-			func() {
-				defer func() { _ = recover() }()
-				ch <- m
-			}()
-		}
-	}(msg, chansToNotify)
-
 	return nil
 }
 
@@ -507,6 +470,8 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 		// still remove from inflight if present, ack is "done" even if duplicate/late
 		inFlight := b.ensureInFlight(topic, group, partition)
 		delete(inFlight, offset)
+		b.dispatchLocked(topic)
+
 		return nil
 	}
 
@@ -529,6 +494,8 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	delete(inFlight, offset)
 
 	parts[partition] = offset
+	b.dispatchLocked(topic)
+
 	return nil
 }
 
@@ -556,4 +523,75 @@ func (b *InMemoryBroker) ensureNextIndex(topic, group string) map[int]int {
 		b.nextIndex[topic][group] = make(map[int]int)
 	}
 	return b.nextIndex[topic][group]
+}
+
+func (b *InMemoryBroker) dispatchLocked(topic string) {
+	ts, ok := b.topics[topic]
+	if !ok {
+		return
+	}
+
+	groupChans, ok := b.consumerChans[topic]
+	if !ok {
+		return
+	}
+
+	for group, chans := range groupChans {
+		if len(chans) == 0 {
+			continue
+		}
+
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
+		}
+
+		nextByPart := b.ensureNextIndex(topic, group)
+
+		for p := range ts.partitions {
+			inflight := b.ensureInFlight(topic, group, p)
+			if b.maxInFlight > 0 && len(inflight) >= b.maxInFlight {
+				continue
+			}
+
+			// resume after last ack if we haven't initialized next index yet
+			if _, ok := nextByPart[p]; !ok {
+				last := int64(-1)
+				if byTopic, ok := b.consumerOffsets[topic]; ok {
+					if byGroup, ok := byTopic[group]; ok {
+						if v, ok := byGroup[p]; ok {
+							last = v
+						}
+					}
+				}
+
+				// find first message with Offset > last
+				idx := 0
+				for idx < len(ts.partitions[p]) && ts.partitions[p][idx].Offset <= last {
+					idx++
+				}
+				nextByPart[p] = idx
+			}
+
+			for nextByPart[p] < len(ts.partitions[p]) {
+				if b.maxInFlight > 0 && len(inflight) >= b.maxInFlight {
+					break
+				}
+
+				m := ts.partitions[p][nextByPart[p]]
+				nextByPart[p]++
+
+				// pick one consumer in the group (round-robin)
+				idx := b.rrCursor[topic][group] % len(chans)
+				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+				ch := chans[idx]
+
+				inflight[m.Offset] = struct{}{}
+
+				go func(ch chan Message, m Message) {
+					defer func() { _ = recover() }()
+					ch <- m
+				}(ch, m)
+			}
+		}
+	}
 }
