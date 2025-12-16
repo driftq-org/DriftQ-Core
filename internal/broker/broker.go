@@ -6,9 +6,16 @@ import (
 	"hash/fnv"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
+
+type inflightEntry struct {
+	Msg      Message
+	SentAt   time.Time
+	Attempts int
+}
 
 // Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior
 type NoopRouter struct{}
@@ -81,7 +88,7 @@ type InMemoryBroker struct {
 	maxInFlight int
 
 	// topic -> group -> partition -> set(offset) of currently in-flight (delivered but not acked)
-	inFlight map[string]map[string]map[int]map[int64]struct{}
+	inFlight map[string]map[string]map[int]map[int64]*inflightEntry
 
 	// topic -> group -> partition -> next index in ts.partitions[partition] to attempt dispatch
 	nextIndex map[string]map[string]map[int]int
@@ -122,7 +129,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		consumerChans:   make(map[string]map[string][]chan Message),
 		rrCursor:        make(map[string]map[string]int),
 		maxInFlight:     2, // for testing, later can raise if needed!
-		inFlight:        make(map[string]map[string]map[int]map[int64]struct{}),
+		inFlight:        make(map[string]map[string]map[int]map[int64]*inflightEntry),
 		nextIndex:       make(map[string]map[string]map[int]int),
 		wal:             wal,
 		router:          r,
@@ -499,17 +506,17 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	return nil
 }
 
-func (b *InMemoryBroker) ensureInFlight(topic, group string, partition int) map[int64]struct{} {
+func (b *InMemoryBroker) ensureInFlight(topic, group string, partition int) map[int64]*inflightEntry {
 	if _, ok := b.inFlight[topic]; !ok {
-		b.inFlight[topic] = make(map[string]map[int]map[int64]struct{})
+		b.inFlight[topic] = make(map[string]map[int]map[int64]*inflightEntry)
 	}
 
 	if _, ok := b.inFlight[topic][group]; !ok {
-		b.inFlight[topic][group] = make(map[int]map[int64]struct{})
+		b.inFlight[topic][group] = make(map[int]map[int64]*inflightEntry)
 	}
 
 	if _, ok := b.inFlight[topic][group][partition]; !ok {
-		b.inFlight[topic][group][partition] = make(map[int64]struct{})
+		b.inFlight[topic][group][partition] = make(map[int64]*inflightEntry)
 	}
 
 	return b.inFlight[topic][group][partition]
@@ -585,7 +592,17 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 				ch := chans[idx]
 
-				inflight[m.Offset] = struct{}{}
+				if e, ok := inflight[m.Offset]; ok {
+					// already in-flight (and shouldn't usually happen), but treat as a re-send attempt
+					e.SentAt = time.Now()
+					e.Attempts++
+				} else {
+					inflight[m.Offset] = &inflightEntry{
+						Msg:      m,
+						SentAt:   time.Now(),
+						Attempts: 1,
+					}
+				}
 
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
