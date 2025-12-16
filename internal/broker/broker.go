@@ -470,6 +470,10 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 		return errors.New("group cannot be empty")
 	}
 
+	if partition < 0 {
+		return errors.New("partition cannot be negative")
+	}
+
 	if offset < 0 {
 		return errors.New("offset cannot be negative")
 	}
@@ -477,11 +481,36 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if _, ok := b.topics[topic]; !ok {
+	ts, ok := b.topics[topic]
+	if !ok {
 		return errors.New("topic does not exist")
 	}
 
-	// If I have a WAL, log this offset so I can restore group progress on restart
+	if partition >= len(ts.partitions) {
+		return errors.New("partition out of range")
+	}
+
+	// Verify offsets map exists
+	groups, ok := b.consumerOffsets[topic]
+	if !ok {
+		groups = make(map[string]map[int]int64)
+		b.consumerOffsets[topic] = groups
+	}
+
+	parts, ok := groups[group]
+	if !ok {
+		parts = make(map[int]int64)
+		groups[group] = parts
+	}
+
+	if cur, ok := parts[partition]; ok && offset <= cur {
+		// still remove from inflight if present, ack is "done" even if duplicate/late
+		inFlight := b.ensureInFlight(topic, group, partition)
+		delete(inFlight, offset)
+		return nil
+	}
+
+	// WAL append only when we advance progress
 	if b.wal != nil {
 		entry := storage.Entry{
 			Type:      storage.RecordTypeOffset,
@@ -496,18 +525,35 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 		}
 	}
 
-	groups, ok := b.consumerOffsets[topic]
-	if !ok {
-		groups = make(map[string]map[int]int64)
-		b.consumerOffsets[topic] = groups
-	}
-
-	parts, ok := groups[group]
-	if !ok {
-		parts = make(map[int]int64)
-		groups[group] = parts
-	}
+	inFlight := b.ensureInFlight(topic, group, partition)
+	delete(inFlight, offset)
 
 	parts[partition] = offset
 	return nil
+}
+
+func (b *InMemoryBroker) ensureInFlight(topic, group string, partition int) map[int64]struct{} {
+	if _, ok := b.inFlight[topic]; !ok {
+		b.inFlight[topic] = make(map[string]map[int]map[int64]struct{})
+	}
+
+	if _, ok := b.inFlight[topic][group]; !ok {
+		b.inFlight[topic][group] = make(map[int]map[int64]struct{})
+	}
+
+	if _, ok := b.inFlight[topic][group][partition]; !ok {
+		b.inFlight[topic][group][partition] = make(map[int64]struct{})
+	}
+
+	return b.inFlight[topic][group][partition]
+}
+
+func (b *InMemoryBroker) ensureNextIndex(topic, group string) map[int]int {
+	if _, ok := b.nextIndex[topic]; !ok {
+		b.nextIndex[topic] = make(map[string]map[int]int)
+	}
+	if _, ok := b.nextIndex[topic][group]; !ok {
+		b.nextIndex[topic][group] = make(map[int]int)
+	}
+	return b.nextIndex[topic][group]
 }
