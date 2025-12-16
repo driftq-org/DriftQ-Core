@@ -360,7 +360,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 	}
 	b.mu.Unlock()
 
-	// Wait for ctx cancel; messages are pushed by dispatchLocked/Produce/redelivery loop.
+	// Wait for ctx cancel; messages are pushed by dispatchLocked/Produce/redelivery loop
 	go func() {
 		defer func() {
 			// Unregister this consumer channel
