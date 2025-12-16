@@ -6,9 +6,16 @@ import (
 	"hash/fnv"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
+
+type inflightEntry struct {
+	Msg      Message
+	SentAt   time.Time
+	Attempts int
+}
 
 // Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior
 type NoopRouter struct{}
@@ -81,13 +88,16 @@ type InMemoryBroker struct {
 	maxInFlight int
 
 	// topic -> group -> partition -> set(offset) of currently in-flight (delivered but not acked)
-	inFlight map[string]map[string]map[int]map[int64]struct{}
+	inFlight map[string]map[string]map[int]map[int64]*inflightEntry
 
 	// topic -> group -> partition -> next index in ts.partitions[partition] to attempt dispatch
 	nextIndex map[string]map[string]map[int]int
 
 	wal    storage.WAL
 	router Router // If nil, "no brain configured"
+
+	ackTimeout    time.Duration
+	redeliverTick time.Duration
 }
 
 func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
@@ -122,10 +132,12 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		consumerChans:   make(map[string]map[string][]chan Message),
 		rrCursor:        make(map[string]map[string]int),
 		maxInFlight:     2, // for testing, later can raise if needed!
-		inFlight:        make(map[string]map[string]map[int]map[int64]struct{}),
+		inFlight:        make(map[string]map[string]map[int]map[int64]*inflightEntry),
 		nextIndex:       make(map[string]map[string]map[int]int),
 		wal:             wal,
 		router:          r,
+		ackTimeout:      2 * time.Second,
+		redeliverTick:   250 * time.Millisecond,
 	}
 }
 
@@ -325,58 +337,31 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 	out := make(chan Message)
 
-	// Build initial snapshot PER PARTITION based on last-acked offsets.
-	b.mu.RLock()
-	ts, exists := b.topics[topic]
-	if !exists {
-		b.mu.RUnlock()
+	// Register this consumer channel for streaming, and kick backlog dispatch through dispatchLocked() so inFlight entries are created (required for redelivery)
+	b.mu.Lock()
+	if _, exists := b.topics[topic]; !exists {
+		b.mu.Unlock()
 		return nil, errors.New("topic does not exist")
 	}
 
-	var lastAckByPart map[int]int64
-	if byTopic, ok := b.consumerOffsets[topic]; ok {
-		if byGroup, ok := byTopic[group]; ok {
-			lastAckByPart = byGroup // map[int]int64 (partition -> last acked offset)
-		}
-	}
-
-	initial := make([]Message, 0)
-	for p, partMsgs := range ts.partitions {
-		last := int64(-1)
-		if lastAckByPart != nil {
-			if v, ok := lastAckByPart[p]; ok {
-				last = v
-			}
-		}
-
-		for _, m := range partMsgs {
-			// ***** Only send messages strictly after what was acked for THIS partition
-			if m.Offset > last {
-				initial = append(initial, m)
-			}
-		}
-	}
-	b.mu.RUnlock()
-
-	// Stable ordering across partitions by global offset.
-	sort.Slice(initial, func(i, j int) bool { return initial[i].Offset < initial[j].Offset })
-
-	// Register this consumer channel for future streaming.
-	b.mu.Lock()
 	groupChans, ok := b.consumerChans[topic]
 	if !ok {
 		groupChans = make(map[string][]chan Message)
 		b.consumerChans[topic] = groupChans
 	}
 
-	sendInitial := len(groupChans[group]) == 0
+	// If this is the FIRST consumer for this group, kick backlog dispatch
+	kick := len(groupChans[group]) == 0
+
 	groupChans[group] = append(groupChans[group], out)
+
+	if kick {
+		b.dispatchLocked(topic)
+	}
 	b.mu.Unlock()
 
-	// Goroutine:
-	//  - sends initial snapshot (optional)
-	//  - then just waits for ctx cancellation (new messages are pushed by Produce into `out`)
-	go func(initial []Message, sendInitial bool) {
+	// Wait for ctx cancel; messages are pushed by dispatchLocked/Produce/redelivery loop
+	go func() {
 		defer func() {
 			// Unregister this consumer channel
 			b.mu.Lock()
@@ -394,9 +379,9 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 					delete(groupChans, group)
 				}
 
+				// Keep rrCursor sane
 				if cursors, ok := b.rrCursor[topic]; ok {
 					if _, ok := groupChans[group]; !ok {
-						// Note: group entry deleted => no consumers
 						delete(cursors, group)
 					} else if cur, ok := cursors[group]; ok && cur >= len(groupChans[group]) {
 						cursors[group] = cur % len(groupChans[group])
@@ -408,18 +393,8 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			close(out)
 		}()
 
-		if sendInitial {
-			for _, m := range initial {
-				select {
-				case <-ctx.Done():
-					return
-				case out <- m:
-				}
-			}
-		}
-
 		<-ctx.Done()
-	}(initial, sendInitial)
+	}()
 
 	return out, nil
 }
@@ -499,17 +474,17 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	return nil
 }
 
-func (b *InMemoryBroker) ensureInFlight(topic, group string, partition int) map[int64]struct{} {
+func (b *InMemoryBroker) ensureInFlight(topic, group string, partition int) map[int64]*inflightEntry {
 	if _, ok := b.inFlight[topic]; !ok {
-		b.inFlight[topic] = make(map[string]map[int]map[int64]struct{})
+		b.inFlight[topic] = make(map[string]map[int]map[int64]*inflightEntry)
 	}
 
 	if _, ok := b.inFlight[topic][group]; !ok {
-		b.inFlight[topic][group] = make(map[int]map[int64]struct{})
+		b.inFlight[topic][group] = make(map[int]map[int64]*inflightEntry)
 	}
 
 	if _, ok := b.inFlight[topic][group][partition]; !ok {
-		b.inFlight[topic][group][partition] = make(map[int64]struct{})
+		b.inFlight[topic][group][partition] = make(map[int64]*inflightEntry)
 	}
 
 	return b.inFlight[topic][group][partition]
@@ -585,12 +560,83 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 				ch := chans[idx]
 
-				inflight[m.Offset] = struct{}{}
+				if e, ok := inflight[m.Offset]; ok {
+					// already in-flight (and shouldn't usually happen), but treat as a re-send attempt
+					e.SentAt = time.Now()
+					e.Attempts++
+				} else {
+					inflight[m.Offset] = &inflightEntry{
+						Msg:      m,
+						SentAt:   time.Now(),
+						Attempts: 1,
+					}
+				}
 
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
 					ch <- m
 				}(ch, m)
+			}
+		}
+	}
+}
+
+func (b *InMemoryBroker) StartRedeliveryLoop(ctx context.Context) {
+	t := time.NewTicker(b.redeliverTick)
+	go func() {
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				b.mu.Lock()
+				b.redeliverExpiredLocked()
+				b.mu.Unlock()
+			}
+		}
+	}()
+}
+
+func (b *InMemoryBroker) redeliverExpiredLocked() {
+	now := time.Now()
+
+	for topic, byGroup := range b.inFlight {
+		groupChans, ok := b.consumerChans[topic]
+		if !ok {
+			continue
+		}
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
+		}
+
+		for group, byPart := range byGroup {
+			chans := groupChans[group]
+			if len(chans) == 0 {
+				continue
+			}
+
+			for _, inflight := range byPart {
+				for _, e := range inflight {
+					if now.Sub(e.SentAt) < b.ackTimeout {
+						continue
+					}
+
+					// pick one consumer in the group (round-robin!)
+					idx := b.rrCursor[topic][group] % len(chans)
+					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+					ch := chans[idx]
+
+					// update inflight bookkeeping
+					e.SentAt = now
+					e.Attempts++
+
+					m := e.Msg
+					go func(ch chan Message, m Message) {
+						defer func() { _ = recover() }()
+						ch <- m
+					}(ch, m)
+				}
 			}
 		}
 	}

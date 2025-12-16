@@ -27,10 +27,6 @@ func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	flag.Parse()
 
-	// // Create broker instance (in-memory for now)
-	// b := broker.NewInMemoryBroker()
-	// s := &server{broker: b}
-
 	// For now I just hardcode a WAL file in the current dir. Later I can make this a flag or env var.
 	wal, err := storage.OpenFileWAL("driftq.wal")
 	if err != nil {
@@ -42,6 +38,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to replay WAL: %v", err)
 	}
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	b.StartRedeliveryLoop(appCtx)
 
 	b.SetRouter(TestRouter{})
 	s := &server{broker: b}
@@ -81,6 +82,7 @@ func main() {
 	<-stop
 
 	log.Println("shutting down...")
+	appCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
