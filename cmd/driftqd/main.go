@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -160,6 +161,11 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.broker.Produce(ctx, topic, msg); err != nil {
+		if errors.Is(err, broker.ErrBackpressure) {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
+
+var ErrBackpressure = errors.New("backpressure: partition is full")
 
 type inflightEntry struct {
 	Msg      Message
@@ -98,6 +101,8 @@ type InMemoryBroker struct {
 
 	ackTimeout    time.Duration
 	redeliverTick time.Duration
+
+	maxPartitionMsgs int
 }
 
 func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
@@ -127,17 +132,18 @@ func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
 // This now lets me plug in both durability and a brain, so passing nil for either is fine (pure in-memory/no routing)
 func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
-		topics:          make(map[string]*topicState),
-		consumerOffsets: make(map[string]map[string]map[int]int64),
-		consumerChans:   make(map[string]map[string][]chan Message),
-		rrCursor:        make(map[string]map[string]int),
-		maxInFlight:     2, // for testing, later can raise if needed!
-		inFlight:        make(map[string]map[string]map[int]map[int64]*inflightEntry),
-		nextIndex:       make(map[string]map[string]map[int]int),
-		wal:             wal,
-		router:          r,
-		ackTimeout:      2 * time.Second,
-		redeliverTick:   250 * time.Millisecond,
+		topics:           make(map[string]*topicState),
+		consumerOffsets:  make(map[string]map[string]map[int]int64),
+		consumerChans:    make(map[string]map[string][]chan Message),
+		rrCursor:         make(map[string]map[string]int),
+		maxInFlight:      2, // for testing, later can raise if needed!
+		inFlight:         make(map[string]map[string]map[int]map[int64]*inflightEntry),
+		nextIndex:        make(map[string]map[string]map[int]int),
+		wal:              wal,
+		router:           r,
+		ackTimeout:       2 * time.Second,
+		redeliverTick:    250 * time.Millisecond,
+		maxPartitionMsgs: 2,
 	}
 }
 
@@ -288,6 +294,16 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 	numPartitions := len(ts.partitions)
 	part := pickPartition(msg.Key, numPartitions)
+
+	if b.maxPartitionMsgs > 0 {
+		slowest := b.slowestAckLocked(topic, part)
+		buffered := bufferedCount(ts.partitions[part], slowest)
+
+		if buffered >= b.maxPartitionMsgs {
+			b.mu.Unlock()
+			return ErrBackpressure
+		}
+	}
 
 	msg.Offset = ts.nextOffset
 	msg.Partition = part
@@ -640,4 +656,38 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 			}
 		}
 	}
+}
+
+func (b *InMemoryBroker) slowestAckLocked(topic string, partition int) int64 {
+	byGroup, ok := b.consumerOffsets[topic]
+	if !ok || len(byGroup) == 0 {
+		return -1
+	}
+
+	slowest := int64(math.MaxInt64)
+	seen := false
+
+	for _, byPart := range byGroup {
+		off, ok := byPart[partition]
+		if !ok {
+			off = -1
+		}
+		if !seen || off < slowest {
+			slowest = off
+			seen = true
+		}
+	}
+
+	if !seen {
+		return -1
+	}
+	return slowest
+}
+
+func bufferedCount(partMsgs []Message, slowestAck int64) int {
+	i := 0
+	for i < len(partMsgs) && partMsgs[i].Offset <= slowestAck {
+		i++
+	}
+	return len(partMsgs) - i
 }
