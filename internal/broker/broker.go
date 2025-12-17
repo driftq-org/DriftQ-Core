@@ -142,7 +142,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		router:           r,
 		ackTimeout:       2 * time.Second,
 		redeliverTick:    250 * time.Millisecond,
-		maxPartitionMsgs: 5,
+		maxPartitionMsgs: 2,
 	}
 }
 
