@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -294,9 +295,14 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	numPartitions := len(ts.partitions)
 	part := pickPartition(msg.Key, numPartitions)
 
-	if b.maxPartitionMsgs > 0 && len(ts.partitions[part]) >= b.maxPartitionMsgs {
-		b.mu.Unlock()
-		return ErrBackpressure
+	if b.maxPartitionMsgs > 0 {
+		slowest := b.slowestAckLocked(topic, part)
+		buffered := bufferedCount(ts.partitions[part], slowest)
+
+		if buffered >= b.maxPartitionMsgs {
+			b.mu.Unlock()
+			return ErrBackpressure
+		}
 	}
 
 	msg.Offset = ts.nextOffset
@@ -650,4 +656,38 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 			}
 		}
 	}
+}
+
+func (b *InMemoryBroker) slowestAckLocked(topic string, partition int) int64 {
+	byGroup, ok := b.consumerOffsets[topic]
+	if !ok || len(byGroup) == 0 {
+		return -1
+	}
+
+	slowest := int64(math.MaxInt64)
+	seen := false
+
+	for _, byPart := range byGroup {
+		off, ok := byPart[partition]
+		if !ok {
+			off = -1
+		}
+		if !seen || off < slowest {
+			slowest = off
+			seen = true
+		}
+	}
+
+	if !seen {
+		return -1
+	}
+	return slowest
+}
+
+func bufferedCount(partMsgs []Message, slowestAck int64) int {
+	i := 0
+	for i < len(partMsgs) && partMsgs[i].Offset <= slowestAck {
+		i++
+	}
+	return len(partMsgs) - i
 }
