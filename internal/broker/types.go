@@ -26,6 +26,7 @@ type Message struct {
 	Key       []byte
 	Value     []byte
 	Routing   *RoutingMetadata
+	Envelope  *Envelope `json:"envelope,omitempty"`
 }
 
 type TopicState struct {
@@ -63,4 +64,27 @@ type Broker interface {
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
 
 	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
+}
+
+type RetryPolicy struct {
+	MaxAttempts  int   `json:"max_attempts,omitempty"`
+	BackoffMs    int64 `json:"backoff_ms,omitempty"`
+	MaxBackoffMs int64 `json:"max_backoff_ms,omitempty"`
+}
+
+type Envelope struct {
+	RunID        string `json:"run_id,omitempty"`
+	StepID       string `json:"step_id,omitempty"`
+	ParentStepID string `json:"parent_step_id,omitempty"`
+
+	Labels map[string]string `json:"labels,omitempty"`
+
+	TargetTopic       string `json:"target_topic,omitempty"`
+	PartitionOverride *int   `json:"partition_override,omitempty"`
+
+	IdempotencyKey string     `json:"idempotency_key,omitempty"`
+	Deadline       *time.Time `json:"deadline,omitempty"`
+
+	RetryPolicy *RetryPolicy `json:"retry_policy,omitempty"`
+	TenantID    string       `json:"tenant_id,omitempty"`
 }
