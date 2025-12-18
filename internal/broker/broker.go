@@ -103,7 +103,8 @@ type InMemoryBroker struct {
 	ackTimeout    time.Duration
 	redeliverTick time.Duration
 
-	maxPartitionMsgs int
+	maxPartitionMsgs  int
+	maxPartitionBytes int
 }
 
 type ProducerOverloadError struct {
@@ -157,18 +158,19 @@ func NewInMemoryBrokerWithWAL(wal storage.WAL) *InMemoryBroker {
 // This now lets me plug in both durability and a brain, so passing nil for either is fine (pure in-memory/no routing)
 func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroker {
 	return &InMemoryBroker{
-		topics:           make(map[string]*topicState),
-		consumerOffsets:  make(map[string]map[string]map[int]int64),
-		consumerChans:    make(map[string]map[string][]chan Message),
-		rrCursor:         make(map[string]map[string]int),
-		maxInFlight:      2, // for testing, later can raise if needed!
-		inFlight:         make(map[string]map[string]map[int]map[int64]*inflightEntry),
-		nextIndex:        make(map[string]map[string]map[int]int),
-		wal:              wal,
-		router:           r,
-		ackTimeout:       2 * time.Second,
-		redeliverTick:    250 * time.Millisecond,
-		maxPartitionMsgs: 2,
+		topics:            make(map[string]*topicState),
+		consumerOffsets:   make(map[string]map[string]map[int]int64),
+		consumerChans:     make(map[string]map[string][]chan Message),
+		rrCursor:          make(map[string]map[string]int),
+		maxInFlight:       2, // for testing, later can raise if needed!
+		inFlight:          make(map[string]map[string]map[int]map[int64]*inflightEntry),
+		nextIndex:         make(map[string]map[string]map[int]int),
+		wal:               wal,
+		router:            r,
+		ackTimeout:        2 * time.Second,
+		redeliverTick:     250 * time.Millisecond,
+		maxPartitionMsgs:  2,
+		maxPartitionBytes: 20,
 	}
 }
 
@@ -320,15 +322,49 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	numPartitions := len(ts.partitions)
 	part := pickPartition(msg.Key, numPartitions)
 
-	if b.maxPartitionMsgs > 0 {
-		slowest := b.slowestAckLocked(topic, part)
-		buffered := bufferedCount(ts.partitions[part], slowest)
+	// if b.maxPartitionMsgs > 0 {
+	// 	slowest := b.slowestAckLocked(topic, part)
+	// 	buffered := bufferedCount(ts.partitions[part], slowest)
 
+	// 	if buffered >= b.maxPartitionMsgs {
+	// 		b.mu.Unlock()
+	// 		return &ProducerOverloadError{
+	// 			Reason:     "partition_buffer_full",
+	// 			RetryAfter: 1 * time.Second, // gotta tune this later
+	// 			Cause:      ErrBackpressure,
+	// 		}
+	// 	}
+	// }
+
+	slowest := int64(-1)
+	if b.maxPartitionMsgs > 0 || b.maxPartitionBytes > 0 {
+		slowest = b.slowestAckLocked(topic, part)
+	}
+
+	// 1) message-count cap
+	if b.maxPartitionMsgs > 0 {
+		buffered := bufferedCount(ts.partitions[part], slowest)
 		if buffered >= b.maxPartitionMsgs {
 			b.mu.Unlock()
 			return &ProducerOverloadError{
 				Reason:     "partition_buffer_full",
-				RetryAfter: 1 * time.Second, // gotta tune this later
+				RetryAfter: 1 * time.Second,
+				Cause:      ErrBackpressure,
+			}
+		}
+	}
+
+	// 2) bytes cap
+	if b.maxPartitionBytes > 0 {
+		bufferedBytes := bufferedBytesCount(ts.partitions[part], slowest)
+		// consider including the *incoming* message too:
+		bufferedBytes += len(msg.Key) + len(msg.Value)
+
+		if bufferedBytes >= b.maxPartitionBytes {
+			b.mu.Unlock()
+			return &ProducerOverloadError{
+				Reason:     "partition_buffer_bytes_full",
+				RetryAfter: 1 * time.Second,
 				Cause:      ErrBackpressure,
 			}
 		}
@@ -719,4 +755,17 @@ func bufferedCount(partMsgs []Message, slowestAck int64) int {
 		i++
 	}
 	return len(partMsgs) - i
+}
+
+func bufferedBytesCount(partMsgs []Message, slowestAck int64) int {
+	bytes := 0
+
+	for i := range partMsgs {
+		if partMsgs[i].Offset <= slowestAck {
+			continue
+		}
+		bytes += len(partMsgs[i].Key) + len(partMsgs[i].Value)
+	}
+
+	return bytes
 }
