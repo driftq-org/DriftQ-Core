@@ -161,8 +161,32 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.broker.Produce(ctx, topic, msg); err != nil {
-		if errors.Is(err, broker.ErrBackpressure) {
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
+		if errors.Is(err, broker.ErrProducerOverloaded) {
+			retryAfter := 1 * time.Second
+			reason := "overloaded"
+
+			var oe *broker.ProducerOverloadError
+			if errors.As(err, &oe) && oe != nil {
+				if oe.RetryAfter > 0 {
+					retryAfter = oe.RetryAfter
+				}
+				if oe.Reason != "" {
+					reason = oe.Reason
+				}
+			}
+
+			secs := int((retryAfter + time.Second - 1) / time.Second)
+
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusTooManyRequests)
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":          "RESOURCE_EXHAUSTED",
+				"reason":         reason,
+				"message":        err.Error(),
+				"retry_after_ms": int(retryAfter / time.Millisecond),
+			})
 			return
 		}
 
