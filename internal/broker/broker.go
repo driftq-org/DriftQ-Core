@@ -13,6 +13,7 @@ import (
 )
 
 var ErrBackpressure = errors.New("backpressure: partition is full")
+var ErrProducerOverloaded = errors.New("producer overload")
 
 type inflightEntry struct {
 	Msg      Message
@@ -103,6 +104,30 @@ type InMemoryBroker struct {
 	redeliverTick time.Duration
 
 	maxPartitionMsgs int
+}
+
+type ProducerOverloadError struct {
+	Reason     string
+	RetryAfter time.Duration
+	Cause      error
+}
+
+func (e *ProducerOverloadError) Error() string {
+	if e == nil {
+		return "producer overload"
+	}
+	if e.Reason != "" {
+		return "producer overload: " + e.Reason
+	}
+	return "producer overload"
+}
+
+func (e *ProducerOverloadError) Is(target error) bool {
+	return target == ErrProducerOverloaded
+}
+
+func (e *ProducerOverloadError) Unwrap() error {
+	return e.Cause
 }
 
 func (NoopRouter) Route(_ context.Context, _ string, msg Message) (RoutingDecision, error) {
@@ -301,7 +326,11 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 
 		if buffered >= b.maxPartitionMsgs {
 			b.mu.Unlock()
-			return ErrBackpressure
+			return &ProducerOverloadError{
+				Reason:     "partition_buffer_full",
+				RetryAfter: 1 * time.Second, // gotta tune this later
+				Cause:      ErrBackpressure,
+			}
 		}
 	}
 
