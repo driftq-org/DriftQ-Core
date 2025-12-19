@@ -414,7 +414,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// We are going to stream NDJSON (one JSON object per line).
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -440,12 +440,15 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 				"value":     string(m.Value),
 			}
 
-			// If routing info exists, include it.
 			if m.Routing != nil {
 				obj["routing"] = map[string]any{
 					"label": m.Routing.Label,
 					"meta":  m.Routing.Meta,
 				}
+			}
+
+			if m.Envelope != nil {
+				obj["envelope"] = m.Envelope
 			}
 
 			if err := enc.Encode(obj); err != nil {
