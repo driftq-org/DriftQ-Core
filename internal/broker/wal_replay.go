@@ -38,6 +38,7 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 				Partition: e.Partition,
 				Value:     e.Value,
 				Offset:    e.Offset,
+				Envelope:  envelopeFromEntry(e),
 			}
 
 			// Restore routing metadata if present.
@@ -73,4 +74,46 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 	}
 
 	return b, nil
+}
+
+func envelopeFromEntry(e storage.Entry) *Envelope {
+	// Decide if we should allocate an envelope at all
+	has := e.RunID != "" ||
+		e.StepID != "" ||
+		e.ParentStepID != "" ||
+		len(e.Labels) > 0 ||
+		e.TargetTopic != "" ||
+		e.PartitionOverride != nil ||
+		e.IdempotencyKey != "" ||
+		e.Deadline != nil ||
+		e.RetryMaxAttempts != 0 ||
+		e.RetryBackoffMs != 0 ||
+		e.RetryMaxBackoffMs != 0 ||
+		e.TenantID != ""
+
+	if !has {
+		return nil
+	}
+
+	env := &Envelope{
+		RunID:             e.RunID,
+		StepID:            e.StepID,
+		ParentStepID:      e.ParentStepID,
+		Labels:            e.Labels,
+		TargetTopic:       e.TargetTopic,
+		PartitionOverride: e.PartitionOverride,
+		IdempotencyKey:    e.IdempotencyKey,
+		Deadline:          e.Deadline,
+		TenantID:          e.TenantID,
+	}
+
+	if e.RetryMaxAttempts != 0 || e.RetryBackoffMs != 0 || e.RetryMaxBackoffMs != 0 {
+		env.RetryPolicy = &RetryPolicy{
+			MaxAttempts:  e.RetryMaxAttempts,
+			BackoffMs:    e.RetryBackoffMs,
+			MaxBackoffMs: e.RetryMaxBackoffMs,
+		}
+	}
+
+	return env
 }
