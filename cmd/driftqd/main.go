@@ -124,17 +124,21 @@ func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
 		if partitionsStr == "" {
 			partitionsStr = "1"
 		}
+
 		partitions, err := strconv.Atoi(partitionsStr)
 		if err != nil || partitions <= 0 {
 			http.Error(w, "invalid partitions", http.StatusBadRequest)
 			return
 		}
+
 		if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("created\n"))
+
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -155,51 +159,17 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		Envelope *broker.Envelope `json:"envelope,omitempty"`
 	}
 
-	parseLabelsCSV := func(s string) (map[string]string, error) {
-		// format: "k1=v1,k2=v2"
-		if s == "" {
-			return nil, nil
-		}
-
-		out := make(map[string]string)
-		parts := strings.Split(s, ",")
-
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-
-			kv := strings.SplitN(p, "=", 2)
-			if len(kv) != 2 {
-				return nil, fmt.Errorf("invalid labels item %q (expected k=v)", p)
-			}
-
-			k := strings.TrimSpace(kv[0])
-			v := strings.TrimSpace(kv[1])
-
-			if k == "" {
-				return nil, fmt.Errorf("invalid labels item %q (empty key)", p)
-			}
-			out[k] = v
-		}
-
-		if len(out) == 0 {
-			return nil, nil
-		}
-
-		return out, nil
-	}
-
 	parseDeadline := func(q url.Values) (*time.Time, error) {
 		// accept either deadline_rfc3339 or deadline_ms
 		if v := strings.TrimSpace(q.Get("deadline_rfc3339")); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
+
 			if err != nil {
 				return nil, fmt.Errorf("invalid deadline_rfc3339: %w", err)
 			}
 			return &t, nil
 		}
+
 		if v := strings.TrimSpace(q.Get("deadline_ms")); v != "" {
 			ms, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
@@ -211,13 +181,38 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		return nil, nil
 	}
 
+	parseOptInt := func(q url.Values, key string) (*int, error) {
+		v := strings.TrimSpace(q.Get(key))
+		if v == "" {
+			return nil, nil
+		}
+
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s", key)
+		}
+		return &n, nil
+	}
+
+	parseOptInt64 := func(q url.Values, key string) (*int64, error) {
+		v := strings.TrimSpace(q.Get(key))
+		if v == "" {
+			return nil, nil
+		}
+
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s", key)
+		}
+		return &n, nil
+	}
+
 	var req produceRequest
 
-	// If JSON body exists, use it. Otherwise fall back to query params.
+	// Note: If JSON body exists, use it. Otherwise fall back to query params
 	if r.Body != nil && r.ContentLength != 0 {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
-
 		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
 			return
@@ -229,7 +224,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		req.Key = q.Get("key")
 		req.Value = q.Get("value")
 
-		// NEW: query-param envelope support
+		// Query-param envelope support (labels skipped for now)
 		env := &broker.Envelope{}
 		anySet := false
 
@@ -283,12 +278,64 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			anySet = true
 		}
 
-		if labels, err := parseLabelsCSV(q.Get("labels")); err != nil {
+		// Retry policy (query params)
+		maxAttemptsPtr, err := parseOptInt(q, "retry_max_attempts")
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
-		} else if labels != nil {
-			env.Labels = labels
-			anySet = true
+		}
+
+		backoffPtr, err := parseOptInt64(q, "retry_backoff_ms")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		maxBackoffPtr, err := parseOptInt64(q, "retry_max_backoff_ms")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validate + build RetryPolicy only if something was provided
+		if maxAttemptsPtr != nil || backoffPtr != nil || maxBackoffPtr != nil {
+			rp := &broker.RetryPolicy{}
+
+			if maxAttemptsPtr != nil {
+				if *maxAttemptsPtr < 0 {
+					http.Error(w, "invalid retry_max_attempts", http.StatusBadRequest)
+					return
+				}
+				rp.MaxAttempts = *maxAttemptsPtr
+			}
+
+			if backoffPtr != nil {
+				if *backoffPtr < 0 {
+					http.Error(w, "invalid retry_backoff_ms", http.StatusBadRequest)
+					return
+				}
+				rp.BackoffMs = *backoffPtr
+			}
+
+			if maxBackoffPtr != nil {
+				if *maxBackoffPtr < 0 {
+					http.Error(w, "invalid retry_max_backoff_ms", http.StatusBadRequest)
+					return
+				}
+				rp.MaxBackoffMs = *maxBackoffPtr
+			}
+
+			// If any backoff knobs are set, require maxAttempts > 0
+			if (backoffPtr != nil || maxBackoffPtr != nil) && rp.MaxAttempts <= 0 {
+				http.Error(w, "retry_max_attempts must be > 0 when using retry backoff params", http.StatusBadRequest)
+				return
+			}
+
+			// If it's effectively empty, keep nil
+			if rp.MaxAttempts != 0 || rp.BackoffMs != 0 || rp.MaxBackoffMs != 0 {
+				env.RetryPolicy = rp
+				anySet = true
+			}
 		}
 
 		if anySet {
