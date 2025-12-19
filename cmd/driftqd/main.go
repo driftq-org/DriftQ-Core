@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -122,17 +124,21 @@ func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
 		if partitionsStr == "" {
 			partitionsStr = "1"
 		}
+
 		partitions, err := strconv.Atoi(partitionsStr)
 		if err != nil || partitions <= 0 {
 			http.Error(w, "invalid partitions", http.StatusBadRequest)
 			return
 		}
+
 		if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("created\n"))
+
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -153,9 +159,57 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		Envelope *broker.Envelope `json:"envelope,omitempty"`
 	}
 
+	parseDeadline := func(q url.Values) (*time.Time, error) {
+		// accept either deadline_rfc3339 or deadline_ms
+		if v := strings.TrimSpace(q.Get("deadline_rfc3339")); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+
+			if err != nil {
+				return nil, fmt.Errorf("invalid deadline_rfc3339: %w", err)
+			}
+			return &t, nil
+		}
+
+		if v := strings.TrimSpace(q.Get("deadline_ms")); v != "" {
+			ms, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid deadline_ms: %w", err)
+			}
+			t := time.Unix(0, ms*int64(time.Millisecond))
+			return &t, nil
+		}
+		return nil, nil
+	}
+
+	parseOptInt := func(q url.Values, key string) (*int, error) {
+		v := strings.TrimSpace(q.Get(key))
+		if v == "" {
+			return nil, nil
+		}
+
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s", key)
+		}
+		return &n, nil
+	}
+
+	parseOptInt64 := func(q url.Values, key string) (*int64, error) {
+		v := strings.TrimSpace(q.Get(key))
+		if v == "" {
+			return nil, nil
+		}
+
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s", key)
+		}
+		return &n, nil
+	}
+
 	var req produceRequest
 
-	// If JSON body exists, use it. Otherwise fall back to query params.
+	// Note: If JSON body exists, use it. Otherwise fall back to query params
 	if r.Body != nil && r.ContentLength != 0 {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
@@ -164,10 +218,129 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		req.Topic = r.URL.Query().Get("topic")
-		req.Key = r.URL.Query().Get("key")
-		req.Value = r.URL.Query().Get("value")
-		// envelope stays nil for query-param calls
+		q := r.URL.Query()
+
+		req.Topic = q.Get("topic")
+		req.Key = q.Get("key")
+		req.Value = q.Get("value")
+
+		// Query-param envelope support (labels skipped for now)
+		env := &broker.Envelope{}
+		anySet := false
+
+		if v := strings.TrimSpace(q.Get("run_id")); v != "" {
+			env.RunID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("step_id")); v != "" {
+			env.StepID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("parent_step_id")); v != "" {
+			env.ParentStepID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("tenant_id")); v != "" {
+			env.TenantID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("idempotency_key")); v != "" {
+			env.IdempotencyKey = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("target_topic")); v != "" {
+			env.TargetTopic = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("partition_override")); v != "" {
+			pi, err := strconv.Atoi(v)
+
+			if err != nil || pi < 0 {
+				http.Error(w, "invalid partition_override", http.StatusBadRequest)
+				return
+			}
+
+			env.PartitionOverride = &pi
+			anySet = true
+		}
+
+		if dl, err := parseDeadline(q); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		} else if dl != nil {
+			env.Deadline = dl
+			anySet = true
+		}
+
+		// Retry policy (query params)
+		maxAttemptsPtr, err := parseOptInt(q, "retry_max_attempts")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		backoffPtr, err := parseOptInt64(q, "retry_backoff_ms")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		maxBackoffPtr, err := parseOptInt64(q, "retry_max_backoff_ms")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validate + build RetryPolicy only if something was provided
+		if maxAttemptsPtr != nil || backoffPtr != nil || maxBackoffPtr != nil {
+			rp := &broker.RetryPolicy{}
+
+			if maxAttemptsPtr != nil {
+				if *maxAttemptsPtr < 0 {
+					http.Error(w, "invalid retry_max_attempts", http.StatusBadRequest)
+					return
+				}
+				rp.MaxAttempts = *maxAttemptsPtr
+			}
+
+			if backoffPtr != nil {
+				if *backoffPtr < 0 {
+					http.Error(w, "invalid retry_backoff_ms", http.StatusBadRequest)
+					return
+				}
+				rp.BackoffMs = *backoffPtr
+			}
+
+			if maxBackoffPtr != nil {
+				if *maxBackoffPtr < 0 {
+					http.Error(w, "invalid retry_max_backoff_ms", http.StatusBadRequest)
+					return
+				}
+				rp.MaxBackoffMs = *maxBackoffPtr
+			}
+
+			// If any backoff knobs are set, require maxAttempts > 0
+			if (backoffPtr != nil || maxBackoffPtr != nil) && rp.MaxAttempts <= 0 {
+				http.Error(w, "retry_max_attempts must be > 0 when using retry backoff params", http.StatusBadRequest)
+				return
+			}
+
+			// If it's effectively empty, keep nil
+			if rp.MaxAttempts != 0 || rp.BackoffMs != 0 || rp.MaxBackoffMs != 0 {
+				env.RetryPolicy = rp
+				anySet = true
+			}
+		}
+
+		if anySet {
+			req.Envelope = env
+		}
 	}
 
 	if req.Topic == "" || req.Value == "" {
@@ -178,7 +351,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	msg := broker.Message{
 		Key:      []byte(req.Key),
 		Value:    []byte(req.Value),
-		Envelope: req.Envelope, // <-- requires Message to have Envelope *Envelope :)
+		Envelope: req.Envelope,
 	}
 
 	if err := s.broker.Produce(ctx, req.Topic, msg); err != nil {
@@ -241,7 +414,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// We are going to stream NDJSON (one JSON object per line).
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -267,12 +440,15 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 				"value":     string(m.Value),
 			}
 
-			// If routing info exists, include it.
 			if m.Routing != nil {
 				obj["routing"] = map[string]any{
 					"label": m.Routing.Label,
 					"meta":  m.Routing.Meta,
 				}
+			}
+
+			if m.Envelope != nil {
+				obj["envelope"] = m.Envelope
 			}
 
 			if err := enc.Encode(obj); err != nil {

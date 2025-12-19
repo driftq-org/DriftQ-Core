@@ -128,7 +128,7 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 				Meta:  decision.Meta,
 			}
 
-			// If router returns routing controls, store them in the envelope
+			// routing controls -> envelope (router wins)
 			if decision.TargetTopic != "" || decision.PartitionOverride != nil {
 				if msg.Envelope == nil {
 					msg.Envelope = &Envelope{}
@@ -150,16 +150,17 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		}
 	}
 
+	// Final topic: envelope target_topic overrides producer topic
 	finalTopic := topic
 	if msg.Envelope != nil && msg.Envelope.TargetTopic != "" {
 		finalTopic = msg.Envelope.TargetTopic
 	}
 
 	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	ts, exists := b.topics[finalTopic]
 	if !exists {
-		b.mu.Unlock()
 		return errors.New("topic does not exist (create it first)")
 	}
 
@@ -169,8 +170,8 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	part := pickPartition(msg.Key, numPartitions)
 	if msg.Envelope != nil && msg.Envelope.PartitionOverride != nil {
 		po := *msg.Envelope.PartitionOverride
+
 		if po < 0 || po >= numPartitions {
-			b.mu.Unlock()
 			return errors.New("partition_override out of range")
 		}
 		part = po
@@ -186,7 +187,6 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	if b.maxPartitionMsgs > 0 {
 		buffered := bufferedCount(ts.partitions[part], slowest)
 		if buffered >= b.maxPartitionMsgs {
-			b.mu.Unlock()
 			return &ProducerOverloadError{
 				Reason:     "partition_buffer_full",
 				RetryAfter: 1 * time.Second,
@@ -201,7 +201,6 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		bufferedBytes += len(msg.Key) + len(msg.Value)
 
 		if bufferedBytes >= b.maxPartitionBytes {
-			b.mu.Unlock()
 			return &ProducerOverloadError{
 				Reason:     "partition_buffer_bytes_full",
 				RetryAfter: 1 * time.Second,
@@ -253,7 +252,6 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		}
 
 		if err := b.wal.Append(entry); err != nil {
-			b.mu.Unlock()
 			return err
 		}
 	}
@@ -265,7 +263,6 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	// Deliver what we can (respects maxInFlight inside dispatch)
 	b.dispatchLocked(finalTopic)
 
-	b.mu.Unlock()
 	return nil
 }
 
