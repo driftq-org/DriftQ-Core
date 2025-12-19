@@ -25,8 +25,9 @@ type Message struct {
 	Partition int
 	Key       []byte
 	Value     []byte
-	Routing   *RoutingMetadata
-	Envelope  *Envelope `json:"envelope,omitempty"`
+
+	Envelope *Envelope
+	Routing  *RoutingMetadata
 }
 
 type TopicState struct {

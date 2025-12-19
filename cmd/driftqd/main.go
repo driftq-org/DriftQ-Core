@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -153,21 +155,145 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		Envelope *broker.Envelope `json:"envelope,omitempty"`
 	}
 
+	parseLabelsCSV := func(s string) (map[string]string, error) {
+		// format: "k1=v1,k2=v2"
+		if s == "" {
+			return nil, nil
+		}
+
+		out := make(map[string]string)
+		parts := strings.Split(s, ",")
+
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) != 2 {
+				return nil, fmt.Errorf("invalid labels item %q (expected k=v)", p)
+			}
+
+			k := strings.TrimSpace(kv[0])
+			v := strings.TrimSpace(kv[1])
+
+			if k == "" {
+				return nil, fmt.Errorf("invalid labels item %q (empty key)", p)
+			}
+			out[k] = v
+		}
+
+		if len(out) == 0 {
+			return nil, nil
+		}
+
+		return out, nil
+	}
+
+	parseDeadline := func(q url.Values) (*time.Time, error) {
+		// accept either deadline_rfc3339 or deadline_ms
+		if v := strings.TrimSpace(q.Get("deadline_rfc3339")); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid deadline_rfc3339: %w", err)
+			}
+			return &t, nil
+		}
+		if v := strings.TrimSpace(q.Get("deadline_ms")); v != "" {
+			ms, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid deadline_ms: %w", err)
+			}
+			t := time.Unix(0, ms*int64(time.Millisecond))
+			return &t, nil
+		}
+		return nil, nil
+	}
+
 	var req produceRequest
 
 	// If JSON body exists, use it. Otherwise fall back to query params.
 	if r.Body != nil && r.ContentLength != 0 {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
+
 		if err := dec.Decode(&req); err != nil {
 			http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 	} else {
-		req.Topic = r.URL.Query().Get("topic")
-		req.Key = r.URL.Query().Get("key")
-		req.Value = r.URL.Query().Get("value")
-		// envelope stays nil for query-param calls
+		q := r.URL.Query()
+
+		req.Topic = q.Get("topic")
+		req.Key = q.Get("key")
+		req.Value = q.Get("value")
+
+		// NEW: query-param envelope support
+		env := &broker.Envelope{}
+		anySet := false
+
+		if v := strings.TrimSpace(q.Get("run_id")); v != "" {
+			env.RunID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("step_id")); v != "" {
+			env.StepID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("parent_step_id")); v != "" {
+			env.ParentStepID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("tenant_id")); v != "" {
+			env.TenantID = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("idempotency_key")); v != "" {
+			env.IdempotencyKey = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("target_topic")); v != "" {
+			env.TargetTopic = v
+			anySet = true
+		}
+
+		if v := strings.TrimSpace(q.Get("partition_override")); v != "" {
+			pi, err := strconv.Atoi(v)
+
+			if err != nil || pi < 0 {
+				http.Error(w, "invalid partition_override", http.StatusBadRequest)
+				return
+			}
+
+			env.PartitionOverride = &pi
+			anySet = true
+		}
+
+		if dl, err := parseDeadline(q); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		} else if dl != nil {
+			env.Deadline = dl
+			anySet = true
+		}
+
+		if labels, err := parseLabelsCSV(q.Get("labels")); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		} else if labels != nil {
+			env.Labels = labels
+			anySet = true
+		}
+
+		if anySet {
+			req.Envelope = env
+		}
 	}
 
 	if req.Topic == "" || req.Value == "" {
@@ -178,7 +304,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	msg := broker.Message{
 		Key:      []byte(req.Key),
 		Value:    []byte(req.Value),
-		Envelope: req.Envelope, // <-- requires Message to have Envelope *Envelope :)
+		Envelope: req.Envelope,
 	}
 
 	if err := s.broker.Produce(ctx, req.Topic, msg); err != nil {
