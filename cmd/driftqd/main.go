@@ -146,21 +146,42 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	topic := r.URL.Query().Get("topic")
-	key := r.URL.Query().Get("key")
-	value := r.URL.Query().Get("value")
+	type produceRequest struct {
+		Topic    string           `json:"topic"`
+		Key      string           `json:"key,omitempty"`
+		Value    string           `json:"value"`
+		Envelope *broker.Envelope `json:"envelope,omitempty"`
+	}
 
-	if topic == "" || value == "" {
+	var req produceRequest
+
+	// If JSON body exists, use it. Otherwise fall back to query params.
+	if r.Body != nil && r.ContentLength != 0 {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		req.Topic = r.URL.Query().Get("topic")
+		req.Key = r.URL.Query().Get("key")
+		req.Value = r.URL.Query().Get("value")
+		// envelope stays nil for query-param calls
+	}
+
+	if req.Topic == "" || req.Value == "" {
 		http.Error(w, "topic and value are required", http.StatusBadRequest)
 		return
 	}
 
 	msg := broker.Message{
-		Key:   []byte(key),
-		Value: []byte(value),
+		Key:      []byte(req.Key),
+		Value:    []byte(req.Value),
+		Envelope: req.Envelope, // <-- requires Message to have Envelope *Envelope :)
 	}
 
-	if err := s.broker.Produce(ctx, topic, msg); err != nil {
+	if err := s.broker.Produce(ctx, req.Topic, msg); err != nil {
 		if errors.Is(err, broker.ErrProducerOverloaded) {
 			retryAfter := 1 * time.Second
 			reason := "overloaded"
@@ -194,6 +215,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("produced\n"))
 }
 

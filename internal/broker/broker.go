@@ -114,36 +114,72 @@ func (b *InMemoryBroker) ListTopics(_ context.Context) ([]string, error) {
 	return names, nil
 }
 
-func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) error {
+func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
 
-	// If I have a router, let it take a look at this message before I do anything
-	// This won't affect routing yet — I just stash whatever metadata it returns
+	// Router hook: routing metadata + optional routing controls (target_topic/partition_override)
 	if b.router != nil {
-		decision, err := b.router.Route(context.Background(), topic, msg)
+		decision, err := b.router.Route(ctx, topic, msg)
 		if err == nil {
 			msg.Routing = &RoutingMetadata{
 				Label: decision.Label,
 				Meta:  decision.Meta,
 			}
+
+			// If router returns routing controls, store them in the envelope
+			if decision.TargetTopic != "" || decision.PartitionOverride != nil {
+				if msg.Envelope == nil {
+					msg.Envelope = &Envelope{}
+				}
+				if decision.TargetTopic != "" {
+					msg.Envelope.TargetTopic = decision.TargetTopic
+				}
+				if decision.PartitionOverride != nil {
+					msg.Envelope.PartitionOverride = decision.PartitionOverride
+				}
+			}
 		}
 	}
 
+	// Deadline enforcement (Reject if already expired)
+	if msg.Envelope != nil && msg.Envelope.Deadline != nil {
+		if time.Now().After(*msg.Envelope.Deadline) {
+			return errors.New("message deadline exceeded")
+		}
+	}
+
+	finalTopic := topic
+	if msg.Envelope != nil && msg.Envelope.TargetTopic != "" {
+		finalTopic = msg.Envelope.TargetTopic
+	}
+
 	b.mu.Lock()
-	ts, exists := b.topics[topic]
+
+	ts, exists := b.topics[finalTopic]
 	if !exists {
 		b.mu.Unlock()
 		return errors.New("topic does not exist (create it first)")
 	}
 
 	numPartitions := len(ts.partitions)
-	part := pickPartition(msg.Key, numPartitions)
 
+	// Partition selection: override > hash(key)
+	part := pickPartition(msg.Key, numPartitions)
+	if msg.Envelope != nil && msg.Envelope.PartitionOverride != nil {
+		po := *msg.Envelope.PartitionOverride
+		if po < 0 || po >= numPartitions {
+			b.mu.Unlock()
+			return errors.New("partition_override out of range")
+		}
+		part = po
+	}
+
+	// Compute slowest ack only if we need it
 	slowest := int64(-1)
 	if b.maxPartitionMsgs > 0 || b.maxPartitionBytes > 0 {
-		slowest = b.slowestAckLocked(topic, part)
+		slowest = b.slowestAckLocked(finalTopic, part)
 	}
 
 	// 1) message-count cap
@@ -162,7 +198,6 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	// 2) bytes cap
 	if b.maxPartitionBytes > 0 {
 		bufferedBytes := bufferedBytesCount(ts.partitions[part], slowest)
-		// consider including the *incoming* message too:
 		bufferedBytes += len(msg.Key) + len(msg.Value)
 
 		if bufferedBytes >= b.maxPartitionBytes {
@@ -178,20 +213,43 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	msg.Offset = ts.nextOffset
 	msg.Partition = part
 
-	// WAL append first (if configured)
+	// WAL append first (if configured!)
 	if b.wal != nil {
 		entry := storage.Entry{
 			Type:      storage.RecordTypeMessage,
-			Topic:     topic,
+			Topic:     finalTopic,
 			Partition: part,
 			Offset:    msg.Offset,
 			Key:       msg.Key,
 			Value:     msg.Value,
 		}
 
+		// routing metadata
 		if msg.Routing != nil {
 			entry.RoutingLabel = msg.Routing.Label
 			entry.RoutingMeta = msg.Routing.Meta
+		}
+
+		// envelope fields
+		if msg.Envelope != nil {
+			entry.RunID = msg.Envelope.RunID
+			entry.StepID = msg.Envelope.StepID
+			entry.ParentStepID = msg.Envelope.ParentStepID
+			entry.Labels = msg.Envelope.Labels
+
+			entry.TargetTopic = msg.Envelope.TargetTopic
+			entry.PartitionOverride = msg.Envelope.PartitionOverride
+
+			entry.IdempotencyKey = msg.Envelope.IdempotencyKey
+			entry.Deadline = msg.Envelope.Deadline
+
+			if msg.Envelope.RetryPolicy != nil {
+				entry.RetryMaxAttempts = msg.Envelope.RetryPolicy.MaxAttempts
+				entry.RetryBackoffMs = msg.Envelope.RetryPolicy.BackoffMs
+				entry.RetryMaxBackoffMs = msg.Envelope.RetryPolicy.MaxBackoffMs
+			}
+
+			entry.TenantID = msg.Envelope.TenantID
 		}
 
 		if err := b.wal.Append(entry); err != nil {
@@ -204,8 +262,8 @@ func (b *InMemoryBroker) Produce(_ context.Context, topic string, msg Message) e
 	ts.nextOffset++
 	ts.partitions[part] = append(ts.partitions[part], msg)
 
-	// NEW: deliver what we can, respecting maxInFlight
-	b.dispatchLocked(topic)
+	// Deliver what we can (respects maxInFlight inside dispatch)
+	b.dispatchLocked(finalTopic)
 
 	b.mu.Unlock()
 	return nil
