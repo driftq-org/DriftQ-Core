@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // Describes what kind of thing this entry represents
@@ -24,14 +25,32 @@ type Entry struct {
 	Partition int        `json:"partition"`
 	Offset    int64      `json:"offset"`
 
-	// For offset records (consumer progress)
 	Group string `json:"group,omitempty"`
 
 	Key   []byte `json:"key,omitempty"`
 	Value []byte `json:"value,omitempty"`
 
-	RoutingLabel string
-	RoutingMeta  map[string]string
+	// routing metadata
+	RoutingLabel string            `json:"routing_label,omitempty"`
+	RoutingMeta  map[string]string `json:"routing_meta,omitempty"`
+
+	// envelope fields
+	RunID        string            `json:"run_id,omitempty"`
+	StepID       string            `json:"step_id,omitempty"`
+	ParentStepID string            `json:"parent_step_id,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+
+	TargetTopic       string `json:"target_topic,omitempty"`
+	PartitionOverride *int   `json:"partition_override,omitempty"`
+
+	IdempotencyKey string     `json:"idempotency_key,omitempty"`
+	Deadline       *time.Time `json:"deadline,omitempty"`
+
+	RetryMaxAttempts  int   `json:"retry_max_attempts,omitempty"`
+	RetryBackoffMs    int64 `json:"retry_backoff_ms,omitempty"`
+	RetryMaxBackoffMs int64 `json:"retry_max_backoff_ms,omitempty"`
+
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 type WAL interface {
