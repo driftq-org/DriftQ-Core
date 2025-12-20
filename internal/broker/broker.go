@@ -463,3 +463,11 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 
 	return nil
 }
+
+func (b *InMemoryBroker) IdempotencyHelper() *IdempotencyConsumerHelper {
+	if b == nil {
+		return nil
+	}
+
+	return NewIdempotencyConsumerHelper(b.idem)
+}
