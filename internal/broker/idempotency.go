@@ -200,6 +200,7 @@ func (h *IdempotencyConsumerHelper) MarkSuccess(topic string, msg Message, resul
 	if h == nil || h.store == nil || msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
 		return
 	}
+
 	h.store.MarkSuccess(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, result)
 }
 
@@ -207,5 +208,6 @@ func (h *IdempotencyConsumerHelper) MarkFailure(topic string, msg Message, cause
 	if h == nil || h.store == nil || msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
 		return
 	}
+
 	h.store.MarkFailure(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, cause)
 }
