@@ -30,6 +30,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 		if !ok {
 			continue
 		}
+
 		if _, ok := b.rrCursor[topic]; !ok {
 			b.rrCursor[topic] = make(map[string]int)
 		}
