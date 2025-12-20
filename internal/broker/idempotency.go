@@ -14,6 +14,10 @@ const (
 
 var ErrIdempotencyInFlight = errors.New("idempotency: key already in-flight")
 
+type IdempotencyConsumerHelper struct {
+	store *IdempotencyStore
+}
+
 type IdempotencyStatus struct {
 	Status    string
 	Result    []byte
@@ -133,4 +137,75 @@ func (s *IdempotencyStore) cleanupLocked(now time.Time) {
 			delete(s.items, k)
 		}
 	}
+}
+
+// This returns the current status for (tenant, topic, key). ok=false means no record exists; not started/expired
+func (s *IdempotencyStore) Check(tenantID, topic, key string) (st IdempotencyStatus, ok bool) {
+	if key == "" {
+		return IdempotencyStatus{}, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(time.Now())
+
+	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	st, ok = s.items[k]
+	return st, ok
+}
+
+func (s *IdempotencyStore) MarkSuccess(tenantID, topic, key string, result []byte) {
+	s.Commit(tenantID, topic, key, result)
+}
+
+func (s *IdempotencyStore) MarkFailure(tenantID, topic, key string, cause error) {
+	s.Fail(tenantID, topic, key, cause)
+}
+
+func NewIdempotencyConsumerHelper(store *IdempotencyStore) *IdempotencyConsumerHelper {
+	return &IdempotencyConsumerHelper{store: store}
+}
+
+// Begin checks if (tenant, topic, idempotency_key) is already COMMITTED
+// Returns:
+// - alreadyDone=true => skip side effect, treat as success
+// - alreadyDone=false => proceed with side effect
+func (h *IdempotencyConsumerHelper) Begin(topic string, msg Message) (alreadyDone bool, priorResult []byte, err error) {
+	if h == nil || h.store == nil {
+		return false, nil, nil
+	}
+	if msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
+		return false, nil, nil // no idempotency requested
+	}
+
+	tenantID := msg.Envelope.TenantID
+	key := msg.Envelope.IdempotencyKey
+
+	st, ok := h.store.Check(tenantID, topic, key)
+	if !ok {
+		return false, nil, nil
+	}
+
+	// For MVP: only COMMITTED means “already done”
+	if st.Status == IdemStatusCommitted {
+		return true, st.Result, nil
+	}
+
+	// FAILED or PENDING: proceed (consumer retry loop will handle it later)
+	return false, nil, nil
+}
+
+func (h *IdempotencyConsumerHelper) MarkSuccess(topic string, msg Message, result []byte) {
+	if h == nil || h.store == nil || msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
+		return
+	}
+	h.store.MarkSuccess(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, result)
+}
+
+func (h *IdempotencyConsumerHelper) MarkFailure(topic string, msg Message, cause error) {
+	if h == nil || h.store == nil || msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
+		return
+	}
+	h.store.MarkFailure(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, cause)
 }
