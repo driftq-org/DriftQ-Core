@@ -30,6 +30,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 		if !ok {
 			continue
 		}
+
 		if _, ok := b.rrCursor[topic]; !ok {
 			b.rrCursor[topic] = make(map[string]int)
 		}
@@ -51,11 +52,15 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 					ch := chans[idx]
 
-					// update inflight bookkeeping
+					// update inflight bookkeeping => SOURCE OF TRUTH :)
 					e.SentAt = now
 					e.Attempts++
 
+					// IMPORTANT: send message with updated attempts
 					m := e.Msg
+					m.Attempts = e.Attempts
+					e.Msg = m // keep stored copy consistent too
+
 					go func(ch chan Message, m Message) {
 						defer func() { _ = recover() }()
 						ch <- m

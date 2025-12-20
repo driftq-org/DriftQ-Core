@@ -28,6 +28,7 @@ type Message struct {
 
 	Envelope *Envelope
 	Routing  *RoutingMetadata
+	Attempts int
 }
 
 type TopicState struct {

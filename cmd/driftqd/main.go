@@ -413,7 +413,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// We are going to stream NDJSON (one JSON object per line).
+	// We are going to stream NDJSON (one JSON object per line)
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 
 	flusher, ok := w.(http.Flusher)
@@ -436,6 +436,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			obj := map[string]any{
 				"partition": m.Partition,
 				"offset":    m.Offset,
+				"attempts":  m.Attempts,
 				"key":       string(m.Key),
 				"value":     string(m.Value),
 			}
