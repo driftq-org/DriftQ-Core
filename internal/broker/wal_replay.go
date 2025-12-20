@@ -49,6 +49,12 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 				}
 			}
 
+			// Rebuild idempotency committed state from WAL
+			if b.idem != nil && m.Envelope != nil && m.Envelope.IdempotencyKey != "" {
+				tenantID := m.Envelope.TenantID // FYI: may be ""
+				b.idem.Commit(tenantID, e.Topic, m.Envelope.IdempotencyKey, nil)
+			}
+
 			ts.partitions[e.Partition] = append(ts.partitions[e.Partition], m)
 
 			if e.Offset >= ts.nextOffset {

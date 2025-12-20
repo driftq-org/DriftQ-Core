@@ -40,6 +40,8 @@ type InMemoryBroker struct {
 
 	maxPartitionMsgs  int
 	maxPartitionBytes int
+
+	idem *IdempotencyStore
 }
 
 func (b *InMemoryBroker) SetRouter(r Router) {
@@ -73,6 +75,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		redeliverTick:     250 * time.Millisecond,
 		maxPartitionMsgs:  2,
 		maxPartitionBytes: 20,
+		idem:              NewIdempotencyStore(10 * time.Minute),
 	}
 }
 
@@ -133,9 +136,11 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 				if msg.Envelope == nil {
 					msg.Envelope = &Envelope{}
 				}
+
 				if decision.TargetTopic != "" {
 					msg.Envelope.TargetTopic = decision.TargetTopic
 				}
+
 				if decision.PartitionOverride != nil {
 					msg.Envelope.PartitionOverride = decision.PartitionOverride
 				}
@@ -156,12 +161,44 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		finalTopic = msg.Envelope.TargetTopic
 	}
 
+	// Idempotency gate (before any side-effects)
+	tenantID := ""
+	idemKey := ""
+	if msg.Envelope != nil {
+		tenantID = msg.Envelope.TenantID
+		idemKey = msg.Envelope.IdempotencyKey
+	}
+
+	startedIdem := false
+	if b.idem != nil && idemKey != "" {
+		alreadyCommitted, err := b.idem.Begin(tenantID, finalTopic, idemKey)
+		if err != nil {
+			// Pending -> reject duplicates
+			return err
+		}
+
+		if alreadyCommitted {
+			// Treat as success, but do NOT produce a duplicate message
+			return nil
+		}
+		startedIdem = true
+	}
+
+	// Helper for failures after Begin()
+	failIdem := func(cause error) {
+		if startedIdem && b.idem != nil && idemKey != "" {
+			b.idem.Fail(tenantID, finalTopic, idemKey, cause)
+		}
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	ts, exists := b.topics[finalTopic]
 	if !exists {
-		return errors.New("topic does not exist (create it first)")
+		err := errors.New("topic does not exist (create it first)")
+		failIdem(err)
+		return err
 	}
 
 	numPartitions := len(ts.partitions)
@@ -172,7 +209,9 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		po := *msg.Envelope.PartitionOverride
 
 		if po < 0 || po >= numPartitions {
-			return errors.New("partition_override out of range")
+			err := errors.New("partition_override out of range")
+			failIdem(err)
+			return err
 		}
 		part = po
 	}
@@ -187,11 +226,13 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	if b.maxPartitionMsgs > 0 {
 		buffered := bufferedCount(ts.partitions[part], slowest)
 		if buffered >= b.maxPartitionMsgs {
-			return &ProducerOverloadError{
+			err := &ProducerOverloadError{
 				Reason:     "partition_buffer_full",
 				RetryAfter: 1 * time.Second,
 				Cause:      ErrBackpressure,
 			}
+			failIdem(err)
+			return err
 		}
 	}
 
@@ -201,11 +242,13 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		bufferedBytes += len(msg.Key) + len(msg.Value)
 
 		if bufferedBytes >= b.maxPartitionBytes {
-			return &ProducerOverloadError{
+			err := &ProducerOverloadError{
 				Reason:     "partition_buffer_bytes_full",
 				RetryAfter: 1 * time.Second,
 				Cause:      ErrBackpressure,
 			}
+			failIdem(err)
+			return err
 		}
 	}
 
@@ -252,6 +295,7 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		}
 
 		if err := b.wal.Append(entry); err != nil {
+			failIdem(err)
 			return err
 		}
 	}
@@ -262,6 +306,11 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 
 	// Deliver what we can (respects maxInFlight inside dispatch)
 	b.dispatchLocked(finalTopic)
+
+	// Mark idempotency as committed ONLY after successful produce
+	if startedIdem && b.idem != nil && idemKey != "" {
+		b.idem.Commit(tenantID, finalTopic, idemKey, nil)
+	}
 
 	return nil
 }

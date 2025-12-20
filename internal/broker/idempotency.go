@@ -6,178 +6,131 @@ import (
 	"time"
 )
 
-// This is the state of a (tenant_id, idempotency_key)
-type IdempotencyStatus string
-
 const (
-	IdempoInProgress IdempotencyStatus = "IN_PROGRESS"
-	IdempoSuccess    IdempotencyStatus = "SUCCESS"
-	IdempoFailure    IdempotencyStatus = "FAILURE"
+	IdemStatusPending   = "PENDING"
+	IdemStatusCommitted = "COMMITTED"
+	IdemStatusFailed    = "FAILED"
 )
 
-// IdempotencyRecord is what we store for a key
-type IdempotencyRecord struct {
-	Status    IdempotencyStatus
+var ErrIdempotencyInFlight = errors.New("idempotency: key already in-flight")
+
+type IdempotencyStatus struct {
+	Status    string
 	Result    []byte
 	LastError string
 	UpdatedAt time.Time
 }
 
-// Simple in-memory map keyed by tenant_id + idempotency_key
-type InMemoryIdempotencyStore struct {
-	mu   sync.Mutex
-	data map[string]map[string]IdempotencyRecord // tenantID -> key -> record
+type idempotencyKey struct {
+	TenantID string
+	Topic    string
+	Key      string
 }
 
-func NewInMemoryIdempotencyStore() *InMemoryIdempotencyStore {
-	return &InMemoryIdempotencyStore{
-		data: make(map[string]map[string]IdempotencyRecord),
+// IdempotencyStore is a tiny in-memory dedupe map.
+// MVP behavior:
+// - Begin() marks (tenant,topic,idKey) as PENDING atomically.
+// - Commit() marks it COMMITTED.
+// - Fail() marks it FAILED.
+// - Entries expire after ttl (to avoid unbounded growth).
+type IdempotencyStore struct {
+	mu    sync.Mutex
+	ttl   time.Duration
+	items map[idempotencyKey]IdempotencyStatus
+}
+
+func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return &IdempotencyStore{
+		ttl:   ttl,
+		items: make(map[idempotencyKey]IdempotencyStatus),
 	}
 }
 
-// Begin attempts to "claim" the idempotency key
-//
+// Begin attempts to start a new idempotent operation
 // Returns:
-// - existing: existing record if one already exists (SUCCESS / FAILURE / IN_PROGRESS)
-// - allowed:  true if caller is allowed to execute the side effect now
-//
-// v1 behavior:
-// - No record      -> create IN_PROGRESS, allowed=true
-// - SUCCESS        -> allowed=false
-// - IN_PROGRESS    -> allowed=false
-// - FAILURE        -> allowed=true (allow retry in v1; I will refine with retry_policy later)
-func (s *InMemoryIdempotencyStore) Begin(tenantID, key string) (existing *IdempotencyRecord, allowed bool, err error) {
-	if tenantID == "" {
-		return nil, false, errors.New("tenant_id is required for idempotency")
-	}
-
+// - alreadyCommitted=true if this key was already committed (caller should treat as success and skip work)
+// - err=ErrIdempotencyInFlight if currently pending (caller should reject to avoid duplicates)
+// - otherwise it records PENDING and returns (false, nil)
+func (s *IdempotencyStore) Begin(tenantID, topic, key string) (alreadyCommitted bool, err error) {
 	if key == "" {
-		return nil, false, errors.New("idempotency_key is required")
+		return false, nil // no idempotency requested
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tenantMap := s.data[tenantID]
-	if tenantMap == nil {
-		tenantMap = make(map[string]IdempotencyRecord)
-		s.data[tenantID] = tenantMap
-	}
+	s.cleanupLocked(time.Now())
 
-	if rec, ok := tenantMap[key]; ok {
-		// return a copy
-		cpy := rec
-		cpy.Result = cloneBytes(rec.Result)
-
-		switch rec.Status {
-		case IdempoSuccess:
-			return &cpy, false, nil
-		case IdempoInProgress:
-			return &cpy, false, nil
-		case IdempoFailure:
-			return &cpy, true, nil
-		default:
-			// unknown -> be conservative: do not allow
-			return &cpy, false, nil
+	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	if st, ok := s.items[k]; ok {
+		switch st.Status {
+		case IdemStatusCommitted:
+			return true, nil
+		case IdemStatusPending:
+			return false, ErrIdempotencyInFlight
+		case IdemStatusFailed:
+			// For MVP: allow retry by replacing FAILED with PENDING
+			// (later we can respect RetryPolicy/backoff)
 		}
 	}
 
-	// Create IN_PROGRESS record
-	tenantMap[key] = IdempotencyRecord{
-		Status:    IdempoInProgress,
-		UpdatedAt: time.Now().UTC(),
+	s.items[k] = IdempotencyStatus{
+		Status:    IdemStatusPending,
+		UpdatedAt: time.Now(),
 	}
 
-	return nil, true, nil
+	return false, nil
 }
 
-func (s *InMemoryIdempotencyStore) CompleteSuccess(tenantID, key string, result []byte) error {
-	if tenantID == "" {
-		return errors.New("tenant_id is required for idempotency")
-	}
-
+func (s *IdempotencyStore) Commit(tenantID, topic, key string, result []byte) {
 	if key == "" {
-		return errors.New("idempotency_key is required")
+		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tenantMap := s.data[tenantID]
-	if tenantMap == nil {
-		tenantMap = make(map[string]IdempotencyRecord)
-		s.data[tenantID] = tenantMap
+	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	s.items[k] = IdempotencyStatus{
+		Status:    IdemStatusCommitted,
+		Result:    result,
+		UpdatedAt: time.Now(),
 	}
-
-	tenantMap[key] = IdempotencyRecord{
-		Status:    IdempoSuccess,
-		Result:    cloneBytes(result),
-		LastError: "",
-		UpdatedAt: time.Now().UTC(),
-	}
-
-	return nil
 }
 
-func (s *InMemoryIdempotencyStore) CompleteFailure(tenantID, key string, lastErr string) error {
-	if tenantID == "" {
-		return errors.New("tenant_id is required for idempotency")
+func (s *IdempotencyStore) Fail(tenantID, topic, key string, cause error) {
+	if key == "" {
+		return
 	}
 
-	if key == "" {
-		return errors.New("idempotency_key is required")
+	msg := ""
+	if cause != nil {
+		msg = cause.Error()
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tenantMap := s.data[tenantID]
-	if tenantMap == nil {
-		tenantMap = make(map[string]IdempotencyRecord)
-		s.data[tenantID] = tenantMap
+	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	s.items[k] = IdempotencyStatus{
+		Status:    IdemStatusFailed,
+		LastError: msg,
+		UpdatedAt: time.Now(),
 	}
-
-	tenantMap[key] = IdempotencyRecord{
-		Status:    IdempoFailure,
-		Result:    nil,
-		LastError: lastErr,
-		UpdatedAt: time.Now().UTC(),
-	}
-	return nil
 }
 
-func (s *InMemoryIdempotencyStore) Get(tenantID, key string) (IdempotencyRecord, bool, error) {
-	if tenantID == "" {
-		return IdempotencyRecord{}, false, errors.New("tenant_id is required for idempotency")
+func (s *IdempotencyStore) cleanupLocked(now time.Time) {
+	if s.ttl <= 0 {
+		return
 	}
 
-	if key == "" {
-		return IdempotencyRecord{}, false, errors.New("idempotency_key is required")
+	cutoff := now.Add(-s.ttl)
+	for k, st := range s.items {
+		if st.UpdatedAt.Before(cutoff) {
+			delete(s.items, k)
+		}
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tenantMap := s.data[tenantID]
-	if tenantMap == nil {
-		return IdempotencyRecord{}, false, nil
-	}
-
-	rec, ok := tenantMap[key]
-	if !ok {
-		return IdempotencyRecord{}, false, nil
-	}
-
-	rec.Result = cloneBytes(rec.Result)
-	return rec, true, nil
-}
-
-func cloneBytes(b []byte) []byte {
-	if len(b) == 0 {
-		return nil
-	}
-
-	out := make([]byte, len(b))
-	copy(out, b)
-	return out
 }
