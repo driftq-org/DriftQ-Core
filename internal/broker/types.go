@@ -6,9 +6,10 @@ import (
 )
 
 type inflightEntry struct {
-	Msg      Message
-	SentAt   time.Time
-	Attempts int
+	Msg           Message
+	SentAt        time.Time
+	Attempts      int
+	NextDeliverAt time.Time
 }
 
 // Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior

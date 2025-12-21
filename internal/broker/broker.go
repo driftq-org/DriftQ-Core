@@ -471,3 +471,113 @@ func (b *InMemoryBroker) IdempotencyHelper() *IdempotencyConsumerHelper {
 
 	return NewIdempotencyConsumerHelper(b.idem)
 }
+
+func computeBackoff(p *RetryPolicy, retryNumber int) time.Duration {
+	if p == nil || p.BackoffMs <= 0 || retryNumber <= 0 {
+		return 0
+	}
+
+	backoff := time.Duration(p.BackoffMs) * time.Millisecond
+
+	// clamp even for retryNumber=1
+	if p.MaxBackoffMs > 0 {
+		max := time.Duration(p.MaxBackoffMs) * time.Millisecond
+		if backoff > max {
+			return max
+		}
+	}
+
+	// exponential: base * 2^(retryNumber-1)
+	for i := 1; i < retryNumber; i++ {
+		// If max is set and we're already at it, stop multiplying
+		if p.MaxBackoffMs > 0 {
+			max := time.Duration(p.MaxBackoffMs) * time.Millisecond
+			if backoff >= max {
+				return max
+			}
+		}
+
+		backoff *= 2
+
+		if p.MaxBackoffMs > 0 {
+			max := time.Duration(p.MaxBackoffMs) * time.Millisecond
+			if backoff > max {
+				return max
+			}
+		}
+	}
+
+	return backoff
+}
+
+// advanceOffsetLocked updates the consumer offset for a given (topic, group, partition) without grabbing any locks
+// Only call this if b.mu is already locked (for example, from inside redeliverExpiredLocked())
+//
+// Same behavior as Ack():
+// - the stored offset is the "last acked offset" for that (topic, group, partition)
+// - we only write to the WAL if the offset actually moves forward
+// - after advancing, we call dispatchLocked(topic) to keep messages moving
+func (b *InMemoryBroker) advanceOffsetLocked(topic, group string, partition int, offset int64) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return errors.New("group cannot be empty")
+	}
+
+	if partition < 0 {
+		return errors.New("partition cannot be negative")
+	}
+
+	if offset < 0 {
+		return errors.New("offset cannot be negative")
+	}
+
+	ts, ok := b.topics[topic]
+	if !ok {
+		return errors.New("topic does not exist")
+	}
+
+	if partition >= len(ts.partitions) {
+		return errors.New("partition out of range")
+	}
+
+	// Ensure offsets maps exist
+	groups, ok := b.consumerOffsets[topic]
+	if !ok {
+		groups = make(map[string]map[int]int64)
+		b.consumerOffsets[topic] = groups
+	}
+
+	parts, ok := groups[group]
+	if !ok {
+		parts = make(map[int]int64)
+		groups[group] = parts
+	}
+
+	// If we're not advancing, do nothing
+	if cur, ok := parts[partition]; ok && offset <= cur {
+		return nil
+	}
+
+	// Persist progress only when advancing
+	if b.wal != nil {
+		entry := storage.Entry{
+			Type:      storage.RecordTypeOffset,
+			Topic:     topic,
+			Group:     group,
+			Partition: partition,
+			Offset:    offset,
+		}
+		if err := b.wal.Append(entry); err != nil {
+			return err
+		}
+	}
+
+	parts[partition] = offset
+
+	// Keep messages flowing
+	b.dispatchLocked(topic)
+	return nil
+}
