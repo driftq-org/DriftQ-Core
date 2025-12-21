@@ -434,9 +434,15 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	if cur, ok := parts[partition]; ok && offset <= cur {
 		// still remove from inflight if present, ack is "done" even if duplicate/late
 		inFlight := b.ensureInFlight(topic, group, partition)
+		if e, ok := inFlight[offset]; ok && e != nil {
+			e.LastError = ""
+			m := e.Msg
+			m.LastError = ""
+			e.Msg = m
+		}
+
 		delete(inFlight, offset)
 		b.dispatchLocked(topic)
-
 		return nil
 	}
 
@@ -456,8 +462,13 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	}
 
 	inFlight := b.ensureInFlight(topic, group, partition)
+	if e, ok := inFlight[offset]; ok && e != nil {
+		e.LastError = ""
+		m := e.Msg
+		m.LastError = ""
+		e.Msg = m
+	}
 	delete(inFlight, offset)
-
 	parts[partition] = offset
 	b.dispatchLocked(topic)
 

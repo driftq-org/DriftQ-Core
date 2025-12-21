@@ -48,6 +48,14 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						continue
 					}
 
+					// If nobody explicitly Nack'ed with a reason, mark a timeout reason. Don't overwrite a real failure reason like "boom"
+					if e.LastError == "" {
+						e.LastError = "ack_timeout"
+						m := e.Msg
+						m.LastError = e.LastError
+						e.Msg = m
+					}
+
 					// Retry scheduling gate
 					if !e.NextDeliverAt.IsZero() && now.Before(e.NextDeliverAt) {
 						continue
