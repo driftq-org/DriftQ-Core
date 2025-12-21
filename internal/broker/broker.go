@@ -640,26 +640,41 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 
 	now := time.Now()
 
-	// 1) store durable-ish retry state (for future dispatch / later WAL)
+	// 1) Persist retry/failure state (durable)
 	rs := b.ensureRetryState(topic, group, partition)
 	rs[offset] = &retryStateEntry{
 		LastError:   reason,
 		LastErrorAt: now,
 	}
 
-	// 2) store on inflight entry (what consumer sees immediately)
+	if b.wal != nil {
+		at := now // take addressable copy
+		entry := storage.Entry{
+			Type:        storage.RecordTypeRetryState,
+			Topic:       topic,
+			Group:       group,
+			Partition:   partition,
+			Offset:      offset,
+			LastError:   reason,
+			LastErrorAt: &at,
+		}
+
+		if err := b.wal.Append(entry); err != nil {
+			return err
+		}
+	}
+
+	// 2) Update inflight bookkeeping so the next delivery surfaces it immediately
 	e.LastError = reason
 	m := e.Msg
 	m.LastError = reason
 	e.Msg = m
 
-	// Make it eligible for immediate redelivery:
-	// - clear backoff gate
-	// - force it to look "timed out" so redelivery loop picks it up now
+	// 3) Make it eligible for immediate redelivery (NOT an ack)
 	e.NextDeliverAt = time.Time{}
 	e.SentAt = now.Add(-b.ackTimeout)
 
-	// Optional: trigger immediate resend now (instead of waiting for next tick)
+	// Optional: resend now (still under lock; your function already does this)
 	b.redeliverExpiredLocked()
 
 	return nil
