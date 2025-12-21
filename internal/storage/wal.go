@@ -14,9 +14,10 @@ import (
 type RecordType uint8
 
 const (
-	RecordTypeMessage RecordType = 1
-	RecordTypeOffset  RecordType = 2
-	RecordTypeTopic   RecordType = 3 // topic/partition metadata (optional for later)
+	RecordTypeMessage    RecordType = 1
+	RecordTypeOffset     RecordType = 2
+	RecordTypeTopic      RecordType = 3 // topic/partition metadata (optional for later)
+	RecordTypeRetryState RecordType = 4 // (topic, group, partition, offset) -> last_error (+ timestamp)
 )
 
 type Entry struct {
@@ -51,6 +52,9 @@ type Entry struct {
 	RetryMaxBackoffMs int64 `json:"retry_max_backoff_ms,omitempty"`
 
 	TenantID string `json:"tenant_id,omitempty"`
+
+	LastError   string     `json:"last_error,omitempty"`
+	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
 }
 
 type WAL interface {

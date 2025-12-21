@@ -74,8 +74,61 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			if !ok || e.Offset > cur {
 				b.consumerOffsets[e.Topic][e.Group][e.Partition] = e.Offset
 			}
+
+		case storage.RecordTypeRetryState:
+			// (topic, group, partition, offset) -> last_error (+ timestamp)
+			if e.Topic == "" || e.Group == "" {
+				// group is required for retry state; ignore malformed entries
+				continue
+			}
+
+			rs := b.ensureRetryState(e.Topic, e.Group, e.Partition)
+
+			at := retryStateEntry{
+				LastError: e.LastError,
+			}
+			if e.LastErrorAt != nil {
+				at.LastErrorAt = *e.LastErrorAt
+			}
+
+			// Last-write-wins naturally since WAL is replayed in order
+			rs[e.Offset] = &at
+
 		default:
-			// For now I just ignore unknown record types but this is a TODO for the future
+			// ignore unknown record types for now
+		}
+	}
+
+	// IMPORTANT: purge retry state for anything already acked, so old errors don’t "resurrect" after restart.
+	for topic, byGroup := range b.consumerOffsets {
+		for group, byPart := range byGroup {
+			for partition, ackedOffset := range byPart {
+				// Only purge if retry state exists
+				if byTopicRS, ok := b.retryState[topic]; ok {
+					if byGroupRS, ok := byTopicRS[group]; ok {
+						if byPartRS, ok := byGroupRS[partition]; ok {
+							for off := range byPartRS {
+								if off <= ackedOffset {
+									delete(byPartRS, off)
+								}
+							}
+
+							// cleanup empties (optional, but keeps memory tidy)
+							if len(byPartRS) == 0 {
+								delete(byGroupRS, partition)
+							}
+
+							if len(byGroupRS) == 0 {
+								delete(byTopicRS, group)
+							}
+
+							if len(byTopicRS) == 0 {
+								delete(b.retryState, topic)
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
