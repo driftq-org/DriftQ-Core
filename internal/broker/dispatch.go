@@ -82,12 +82,12 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				// IMPORTANT: Attempts is delivery-attempt count, sourced from inflight entry
 				send := m
 				send.Attempts = attempt
+				send.LastError = inflight[m.Offset].LastError
 
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
 					ch <- m
 				}(ch, send)
-
 			}
 		}
 	}

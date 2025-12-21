@@ -63,6 +63,7 @@ func main() {
 
 	// Dev-only topic admin endpoints
 	mux.HandleFunc("/topics", s.handleTopics)
+	mux.HandleFunc("/nack", s.handleNack)
 
 	srv := &http.Server{
 		Addr:         *addr,
@@ -434,11 +435,12 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			}
 
 			obj := map[string]any{
-				"partition": m.Partition,
-				"offset":    m.Offset,
-				"attempts":  m.Attempts,
-				"key":       string(m.Key),
-				"value":     string(m.Value),
+				"partition":  m.Partition,
+				"offset":     m.Offset,
+				"attempts":   m.Attempts,
+				"key":        string(m.Key),
+				"value":      string(m.Value),
+				"last_error": m.LastError,
 			}
 
 			if m.Routing != nil {
@@ -501,6 +503,49 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = w.Write([]byte("acked\n"))
+}
+
+func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+
+	topic := r.URL.Query().Get("topic")
+	group := r.URL.Query().Get("group")
+	offsetStr := r.URL.Query().Get("offset")
+	partitionStr := r.URL.Query().Get("partition")
+	reason := r.URL.Query().Get("reason")
+
+	if partitionStr == "" {
+		partitionStr = "0" // default for now
+	}
+
+	partition, err := strconv.Atoi(partitionStr)
+	if err != nil || partition < 0 {
+		http.Error(w, "invalid partition", http.StatusBadRequest)
+		return
+	}
+
+	if topic == "" || group == "" || offsetStr == "" {
+		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
+		return
+	}
+
+	offset, err := strconv.ParseInt(offsetStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.broker.Nack(ctx, topic, group, partition, offset, reason); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	_, _ = w.Write([]byte("nacked\n"))
 }
 
 func (TestRouter) Route(_ context.Context, topic string, msg broker.Message) (broker.RoutingDecision, error) {

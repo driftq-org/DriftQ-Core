@@ -434,9 +434,15 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	if cur, ok := parts[partition]; ok && offset <= cur {
 		// still remove from inflight if present, ack is "done" even if duplicate/late
 		inFlight := b.ensureInFlight(topic, group, partition)
+		if e, ok := inFlight[offset]; ok && e != nil {
+			e.LastError = ""
+			m := e.Msg
+			m.LastError = ""
+			e.Msg = m
+		}
+
 		delete(inFlight, offset)
 		b.dispatchLocked(topic)
-
 		return nil
 	}
 
@@ -456,8 +462,13 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	}
 
 	inFlight := b.ensureInFlight(topic, group, partition)
+	if e, ok := inFlight[offset]; ok && e != nil {
+		e.LastError = ""
+		m := e.Msg
+		m.LastError = ""
+		e.Msg = m
+	}
 	delete(inFlight, offset)
-
 	parts[partition] = offset
 	b.dispatchLocked(topic)
 
@@ -579,5 +590,57 @@ func (b *InMemoryBroker) advanceOffsetLocked(topic, group string, partition int,
 
 	// Keep messages flowing
 	b.dispatchLocked(topic)
+	return nil
+}
+
+func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition int, offset int64, reason string) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return errors.New("group cannot be empty")
+	}
+
+	if partition < 0 {
+		return errors.New("partition cannot be negative")
+	}
+
+	if offset < 0 {
+		return errors.New("offset cannot be negative")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	ts, ok := b.topics[topic]
+	if !ok {
+		return errors.New("topic does not exist")
+	}
+
+	if partition >= len(ts.partitions) {
+		return errors.New("partition out of range")
+	}
+
+	inFlight := b.ensureInFlight(topic, group, partition)
+	e, ok := inFlight[offset]
+	if !ok || e == nil {
+		return errors.New("message is not in-flight")
+	}
+
+	// Store failure reason
+	e.LastError = reason
+	m := e.Msg
+	m.LastError = reason
+	e.Msg = m
+
+	// Make it eligible for immediate redelivery
+	// We do not change offsets; this is NOT an ack
+	e.NextDeliverAt = time.Time{}
+	e.SentAt = time.Now().Add(-b.ackTimeout)
+
+	// Optional: trigger immediate resend now (instead of waiting for next tick)
+	b.redeliverExpiredLocked()
+
 	return nil
 }
