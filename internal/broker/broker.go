@@ -473,20 +473,36 @@ func (b *InMemoryBroker) IdempotencyHelper() *IdempotencyConsumerHelper {
 }
 
 func computeBackoff(p *RetryPolicy, retryNumber int) time.Duration {
-	if p == nil || p.BackoffMs <= 0 {
+	if p == nil || p.BackoffMs <= 0 || retryNumber <= 0 {
 		return 0
 	}
 
-	// exponential: backoff * 2^(retryNumber-1)
 	backoff := time.Duration(p.BackoffMs) * time.Millisecond
+
+	// clamp even for retryNumber=1
+	if p.MaxBackoffMs > 0 {
+		max := time.Duration(p.MaxBackoffMs) * time.Millisecond
+		if backoff > max {
+			return max
+		}
+	}
+
+	// exponential: base * 2^(retryNumber-1)
 	for i := 1; i < retryNumber; i++ {
+		// If max is set and we're already at it, stop multiplying
+		if p.MaxBackoffMs > 0 {
+			max := time.Duration(p.MaxBackoffMs) * time.Millisecond
+			if backoff >= max {
+				return max
+			}
+		}
+
 		backoff *= 2
 
 		if p.MaxBackoffMs > 0 {
 			max := time.Duration(p.MaxBackoffMs) * time.Millisecond
 			if backoff > max {
-				backoff = max
-				break
+				return max
 			}
 		}
 	}
