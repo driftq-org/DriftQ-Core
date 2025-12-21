@@ -63,26 +63,29 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				idx := b.rrCursor[topic][group] % len(chans)
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 				ch := chans[idx]
-				attempt := 0
 
-				if e, ok := inflight[m.Offset]; ok {
-					// already in-flight (and shouldn't usually happen), but treat as a re-send attempt
-					e.SentAt = time.Now()
-					e.Attempts++
-					attempt = e.Attempts
-				} else {
-					inflight[m.Offset] = &inflightEntry{
-						Msg:      m,
-						SentAt:   time.Now(),
-						Attempts: 1,
+				e, ok := inflight[m.Offset]
+				if !ok || e == nil {
+					rs := b.ensureRetryState(topic, group, p)
+
+					lastErr := ""
+					if st, ok := rs[m.Offset]; ok && st != nil {
+						lastErr = st.LastError
 					}
-					attempt = 1
+
+					e = &inflightEntry{
+						Msg:       m,
+						SentAt:    time.Now(),
+						Attempts:  1,
+						LastError: lastErr,
+					}
+					inflight[m.Offset] = e
 				}
 
-				// IMPORTANT: Attempts is delivery-attempt count, sourced from inflight entry
+				// Build message to send (Attempts and LastError come from inflight entry)
 				send := m
-				send.Attempts = attempt
-				send.LastError = inflight[m.Offset].LastError
+				send.Attempts = e.Attempts
+				send.LastError = e.LastError
 
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
