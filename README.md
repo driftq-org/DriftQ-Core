@@ -4,31 +4,57 @@
   <a href='https://drift-q.org' target="_blank">Website</a>
 </p>
 
-A lightweight, extensible message broker built in Go — designed for the AI-native era.
+**Status:** Experimental / pre-release (v1 milestone in progress).
+**Production:** Not production-ready. APIs and semantics may change without notice.
 
-**DriftQ Core** is the open-source, high-performance message broker powering the AI-native messaging platform DriftQ.
-
----
-
-## Overview
-DriftQ Core provides the foundational broker components:
-- topics, partitions, producers, consumers
-- at-least-once delivery
-- durable write-ahead log (WAL)
-- Prometheus metrics and OpenTelemetry traces
-- pluggable policy layer (for AI-driven routing)
-
-The core is **100% Go**, designed for simplicity, concurrency, and reliability.
+DriftQ Core is a lightweight, extensible message broker built in Go — designed for the AI-native era.
 
 ---
 
-## Architecture
+## What this is (today)
 
-Producers → Broker (driftqd) → Storage (WAL) → Consumers
-- **Broker:** Manages message flow and offsets.
-- **Storage:** WAL + compaction.
-- **Scheduler:** Manages consumer groups and retries.
-- **Policy:** External interface for DriftQ Brain (AI optimizer, optional).
+DriftQ Core currently implements a **minimal but real broker** with:
+- topics + partitions
+- consumer groups + per-partition offsets + acks
+- **at-least-once** delivery (redelivery on ack timeout)
+- durability via a simple **write-ahead log (WAL)** with replay on startup
+- an **agent message envelope** (run/step IDs, routing controls, retry policy, tenant + idempotency fields)
+- a pluggable **router hook** (“brain v0”) that can label messages and request routing overrides
+
+What it is **not** (yet):
+- production-ready software (experimental / pre-release)
+- a stable API/SDK (expect breaking changes)
+- a security or compliance solution
+- a fully durable retry/DLQ system (durable retry state is still evolving)
+
+---
+
+## Semantics docs (v1 roadmap so far)
+
+The best way to understand “what DriftQ guarantees” is the versioned semantics docs:
+
+- `docs/v1/` — v1 milestone contracts (v1.1 → v1.6)
+- `docs/architecture.md` — cross-cutting architecture notes
+
+Start here:
+- `docs/v1/v1.1-broker-core-consumer-groups.md`
+- `docs/v1/v1.2-partitions-minimal.md`
+- `docs/v1/v1.3-durability-wal.md`
+- `docs/v1/v1.4-agent-message-envelope.md`
+- `docs/v1/v1.5-ai-native-router-hook.md`
+- `docs/v1/v1.6-idempotency.md`
+
+---
+
+## Architecture (current mental model)
+
+Producers → Broker (`driftqd`) → Storage (WAL) → Consumers
+
+Core components:
+- **Broker:** message flow, partitions, consumer groups, offsets, redelivery
+- **Storage:** WAL append + replay (MVP)
+- **Router hook:** optional labeling + routing overrides (“brain v0”)
+- **Envelope:** workflow/agent metadata carried with each message
 
 ---
 
@@ -39,37 +65,63 @@ Producers → Broker (driftqd) → Storage (WAL) → Consumers
 
 ---
 
-## Quick Start
+## Quick Start (current repo layout)
+
 ```bash
-# Clone and build
+# Clone
 git clone https://github.com/driftq-org/driftq-core.git
 cd driftq-core
-make build
 
-# Run broker
-./bin/driftqd --config ./deploy/config.yaml
+# Run the dev broker (current CLI flags)
+go run ./cmd/driftqd/main.go --addr :8080
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) to see metrics or UI.
+Dev HTTP endpoints (MVP):
+- `POST /topics?name=<topic>&partitions=<n>`
+- `POST /produce` (JSON body) or `POST /produce?topic=...&value=...`
+- `GET  /consume?topic=...&group=...` (streams NDJSON)
+- `POST /ack?topic=...&group=...&partition=...&offset=...`
 
+> Note: The README intentionally documents the **current dev surface**. This will be replaced by proper public APIs/SDKs in later milestones.
 
-## Features
-- Lightweight Go broker with durable storage
-- At-least-once delivery
-- Partitioned topics and consumer groups
-- Prometheus + OpenTelemetry metrics
+---
 
+## Features (implemented)
+- lightweight Go broker core (in-memory state)
+- partitioned topics + consumer groups
+- at-least-once delivery with ack-timeout redelivery
+- WAL persistence for messages + offsets + replay on startup
+- router hook for metadata labeling + routing overrides
+- envelope fields for workflow identity + routing controls + retry/idempotency knobs (v1.4+)
 
- ## Roadmap
- - [ ] WAL persistence engine
- - [ ] Consumer group coordination
- - [ ] CLI for topic management
- - [ ] Policy gRPC interface (AI hook)
+---
 
+## Roadmap (v1 milestones)
+
+See `docs/v1/` for the exact contracts. High-level:
+- v1.6: idempotency + “exactly-once-ish side effects” (worker-boundary dedupe)
+- next: durable retry/DLQ state in WAL + DLQ routing + tests
+- v1.7+: public APIs
+- v1.8+: SDKs
+- v1.9+: observability
+- v1.10+: test suite hardening
+- demo: end-to-end example pipeline
+
+---
 
 ## Contributing
-Contributions are welcome! Please open an issue or pull request to discuss changes.
 
+Contributions are welcome, but expect churn while v1 is in flight.
+
+Suggested workflow:
+1) Open an issue describing the change.
+2) Link the relevant `docs/v1/v1.x-*.md` contract you’re touching.
+3) Keep PRs small and milestone-scoped.
+
+---
 
 ## License
+
 Licensed under the [Apache License 2.0](./LICENSE).
+
+**No warranty:** This software is provided “AS IS”, without warranty of any kind, express or implied.
