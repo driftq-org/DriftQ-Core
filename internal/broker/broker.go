@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,8 @@ type InMemoryBroker struct {
 	maxPartitionBytes int
 
 	idem *IdempotencyStore
+
+	retryState map[string]map[string]map[int]map[int64]*retryStateEntry
 }
 
 func (b *InMemoryBroker) SetRouter(r Router) {
@@ -76,6 +79,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		maxPartitionMsgs:  2,
 		maxPartitionBytes: 20,
 		idem:              NewIdempotencyStore(10 * time.Minute),
+		retryState:        make(map[string]map[string]map[int]map[int64]*retryStateEntry),
 	}
 }
 
@@ -610,6 +614,12 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		return errors.New("offset cannot be negative")
 	}
 
+	// Normalize reason
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "nack"
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -628,16 +638,26 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		return errors.New("message is not in-flight")
 	}
 
-	// Store failure reason
+	now := time.Now()
+
+	// 1) store durable-ish retry state (for future dispatch / later WAL)
+	rs := b.ensureRetryState(topic, group, partition)
+	rs[offset] = &retryStateEntry{
+		LastError:   reason,
+		LastErrorAt: now,
+	}
+
+	// 2) store on inflight entry (what consumer sees immediately)
 	e.LastError = reason
 	m := e.Msg
 	m.LastError = reason
 	e.Msg = m
 
-	// Make it eligible for immediate redelivery
-	// We do not change offsets; this is NOT an ack
+	// Make it eligible for immediate redelivery:
+	// - clear backoff gate
+	// - force it to look "timed out" so redelivery loop picks it up now
 	e.NextDeliverAt = time.Time{}
-	e.SentAt = time.Now().Add(-b.ackTimeout)
+	e.SentAt = now.Add(-b.ackTimeout)
 
 	// Optional: trigger immediate resend now (instead of waiting for next tick)
 	b.redeliverExpiredLocked()
