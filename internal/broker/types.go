@@ -10,6 +10,7 @@ type inflightEntry struct {
 	SentAt        time.Time
 	Attempts      int
 	NextDeliverAt time.Time
+	LastError     string
 }
 
 // Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior
@@ -30,6 +31,8 @@ type Message struct {
 	Envelope *Envelope
 	Routing  *RoutingMetadata
 	Attempts int
+
+	LastError string
 }
 
 type TopicState struct {
@@ -67,6 +70,7 @@ type Broker interface {
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
 
 	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
+	Nack(ctx context.Context, topic, group string, partition int, offset int64, reason string) error
 }
 
 type RetryPolicy struct {

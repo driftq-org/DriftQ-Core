@@ -83,6 +83,12 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				send := m
 				send.Attempts = attempt
 
+				if e, ok := inflight[m.Offset]; ok && e != nil {
+					send.LastError = e.LastError
+				} else {
+					send.LastError = ""
+				}
+
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
 					ch <- m

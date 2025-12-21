@@ -91,6 +91,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					// Send message with updated attempts
 					m := e.Msg
 					m.Attempts = e.Attempts
+					m.LastError = e.LastError
 					e.Msg = m
 
 					go func(ch chan Message, m Message) {
