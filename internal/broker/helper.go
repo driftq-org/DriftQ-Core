@@ -3,6 +3,7 @@ package broker
 import (
 	"hash/fnv"
 	"math"
+	"strings"
 )
 
 func pickPartition(key []byte, numPartitions int) int {
@@ -59,5 +60,20 @@ func (b *InMemoryBroker) slowestAckLocked(topic string, partition int) int64 {
 	if !seen {
 		return -1
 	}
+
 	return slowest
+}
+
+func appendLastError(existing, addition string) string {
+	addition = strings.TrimSpace(addition)
+	if addition == "" {
+		return existing
+	}
+
+	existing = strings.TrimSpace(existing)
+	if existing == "" {
+		return addition
+	}
+
+	return existing + " | " + addition
 }

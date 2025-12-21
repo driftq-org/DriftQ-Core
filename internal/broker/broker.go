@@ -83,7 +83,6 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 	}
 }
 
-// CreateTopic creates a topic if it does not already exist. And partitions is ignored for now (TODO: real partitioning later).
 func (b *InMemoryBroker) CreateTopic(_ context.Context, name string, partitions int) error {
 	if name == "" {
 		return errors.New("topic name cannot be empty")
@@ -96,16 +95,7 @@ func (b *InMemoryBroker) CreateTopic(_ context.Context, name string, partitions 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if _, exists := b.topics[name]; exists {
-		return nil
-	}
-
-	b.topics[name] = &TopicState{
-		partitions: make([][]Message, partitions),
-		nextOffset: 0,
-	}
-
-	return nil
+	return b.createTopicLocked(name, partitions)
 }
 
 // ListTopics returns the list of topic names (sorted for stability).
@@ -140,11 +130,9 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 				if msg.Envelope == nil {
 					msg.Envelope = &Envelope{}
 				}
-
 				if decision.TargetTopic != "" {
 					msg.Envelope.TargetTopic = decision.TargetTopic
 				}
-
 				if decision.PartitionOverride != nil {
 					msg.Envelope.PartitionOverride = decision.PartitionOverride
 				}
@@ -177,10 +165,8 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	if b.idem != nil && idemKey != "" {
 		alreadyCommitted, err := b.idem.Begin(tenantID, finalTopic, idemKey)
 		if err != nil {
-			// Pending -> reject duplicates
 			return err
 		}
-
 		if alreadyCommitted {
 			// Treat as success, but do NOT produce a duplicate message
 			return nil
@@ -188,7 +174,6 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 		startedIdem = true
 	}
 
-	// Helper for failures after Begin()
 	failIdem := func(cause error) {
 		if startedIdem && b.idem != nil && idemKey != "" {
 			b.idem.Fail(tenantID, finalTopic, idemKey, cause)
@@ -196,120 +181,13 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	err := b.produceLocked(ctx, finalTopic, msg)
+	b.mu.Unlock()
 
-	ts, exists := b.topics[finalTopic]
-	if !exists {
-		err := errors.New("topic does not exist (create it first)")
+	if err != nil {
 		failIdem(err)
 		return err
 	}
-
-	numPartitions := len(ts.partitions)
-
-	// Partition selection: override > hash(key)
-	part := pickPartition(msg.Key, numPartitions)
-	if msg.Envelope != nil && msg.Envelope.PartitionOverride != nil {
-		po := *msg.Envelope.PartitionOverride
-
-		if po < 0 || po >= numPartitions {
-			err := errors.New("partition_override out of range")
-			failIdem(err)
-			return err
-		}
-		part = po
-	}
-
-	// Compute slowest ack only if we need it
-	slowest := int64(-1)
-	if b.maxPartitionMsgs > 0 || b.maxPartitionBytes > 0 {
-		slowest = b.slowestAckLocked(finalTopic, part)
-	}
-
-	// 1) message-count cap
-	if b.maxPartitionMsgs > 0 {
-		buffered := bufferedCount(ts.partitions[part], slowest)
-		if buffered >= b.maxPartitionMsgs {
-			err := &ProducerOverloadError{
-				Reason:     "partition_buffer_full",
-				RetryAfter: 1 * time.Second,
-				Cause:      ErrBackpressure,
-			}
-			failIdem(err)
-			return err
-		}
-	}
-
-	// 2) bytes cap
-	if b.maxPartitionBytes > 0 {
-		bufferedBytes := bufferedBytesCount(ts.partitions[part], slowest)
-		bufferedBytes += len(msg.Key) + len(msg.Value)
-
-		if bufferedBytes >= b.maxPartitionBytes {
-			err := &ProducerOverloadError{
-				Reason:     "partition_buffer_bytes_full",
-				RetryAfter: 1 * time.Second,
-				Cause:      ErrBackpressure,
-			}
-			failIdem(err)
-			return err
-		}
-	}
-
-	msg.Offset = ts.nextOffset
-	msg.Partition = part
-
-	// WAL append first (if configured!)
-	if b.wal != nil {
-		entry := storage.Entry{
-			Type:      storage.RecordTypeMessage,
-			Topic:     finalTopic,
-			Partition: part,
-			Offset:    msg.Offset,
-			Key:       msg.Key,
-			Value:     msg.Value,
-		}
-
-		// routing metadata
-		if msg.Routing != nil {
-			entry.RoutingLabel = msg.Routing.Label
-			entry.RoutingMeta = msg.Routing.Meta
-		}
-
-		// envelope fields
-		if msg.Envelope != nil {
-			entry.RunID = msg.Envelope.RunID
-			entry.StepID = msg.Envelope.StepID
-			entry.ParentStepID = msg.Envelope.ParentStepID
-			entry.Labels = msg.Envelope.Labels
-
-			entry.TargetTopic = msg.Envelope.TargetTopic
-			entry.PartitionOverride = msg.Envelope.PartitionOverride
-
-			entry.IdempotencyKey = msg.Envelope.IdempotencyKey
-			entry.Deadline = msg.Envelope.Deadline
-
-			if msg.Envelope.RetryPolicy != nil {
-				entry.RetryMaxAttempts = msg.Envelope.RetryPolicy.MaxAttempts
-				entry.RetryBackoffMs = msg.Envelope.RetryPolicy.BackoffMs
-				entry.RetryMaxBackoffMs = msg.Envelope.RetryPolicy.MaxBackoffMs
-			}
-
-			entry.TenantID = msg.Envelope.TenantID
-		}
-
-		if err := b.wal.Append(entry); err != nil {
-			failIdem(err)
-			return err
-		}
-	}
-
-	// Commit to in-memory state
-	ts.nextOffset++
-	ts.partitions[part] = append(ts.partitions[part], msg)
-
-	// Deliver what we can (respects maxInFlight inside dispatch)
-	b.dispatchLocked(finalTopic)
 
 	// Mark idempotency as committed ONLY after successful produce
 	if startedIdem && b.idem != nil && idemKey != "" {
@@ -640,22 +518,25 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 
 	now := time.Now()
 
-	// 1) Persist retry/failure state (durable)
+	// Merge with any existing error (keep original + add new detail)
+	merged := appendLastError(e.LastError, reason)
+
+	// 1) Persist retry/failure state (durable) with merged error
 	rs := b.ensureRetryState(topic, group, partition)
 	rs[offset] = &retryStateEntry{
-		LastError:   reason,
+		LastError:   merged,
 		LastErrorAt: now,
 	}
 
 	if b.wal != nil {
-		at := now // take addressable copy
+		at := now // addressable copy
 		entry := storage.Entry{
 			Type:        storage.RecordTypeRetryState,
 			Topic:       topic,
 			Group:       group,
 			Partition:   partition,
 			Offset:      offset,
-			LastError:   reason,
+			LastError:   merged,
 			LastErrorAt: &at,
 		}
 
@@ -664,18 +545,157 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		}
 	}
 
-	// 2) Update inflight bookkeeping so the next delivery surfaces it immediately
-	e.LastError = reason
+	// 2) Update inflight bookkeeping so next delivery surfaces merged error immediately
+	e.LastError = merged
 	m := e.Msg
-	m.LastError = reason
+	m.LastError = merged
 	e.Msg = m
 
 	// 3) Make it eligible for immediate redelivery (NOT an ack)
 	e.NextDeliverAt = time.Time{}
 	e.SentAt = now.Add(-b.ackTimeout)
 
-	// Optional: resend now (still under lock; your function already does this)
+	// Optional: resend now
 	b.redeliverExpiredLocked()
+
+	return nil
+}
+
+// Creates a topic assuming b.mu is held
+func (b *InMemoryBroker) createTopicLocked(name string, partitions int) error {
+	if name == "" {
+		return errors.New("topic name cannot be empty")
+	}
+
+	if partitions <= 0 {
+		return errors.New("partitions must be > 0")
+	}
+
+	if _, exists := b.topics[name]; exists {
+		return nil
+	}
+
+	b.topics[name] = &TopicState{
+		partitions: make([][]Message, partitions),
+		nextOffset: 0,
+	}
+
+	return nil
+}
+
+// produceLocked produces assuming b.mu is held.
+// IMPORTANT: This does NOT run the router hook and does NOT do idempotency Begin/Commit
+// Callers decide those behaviors (public Produce does, DLQ publish should NOT)
+func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Message) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	ts, exists := b.topics[topic]
+	if !exists {
+		return errors.New("topic does not exist (create it first)")
+	}
+
+	numPartitions := len(ts.partitions)
+	if numPartitions <= 0 {
+		return errors.New("topic has no partitions")
+	}
+
+	// Partition selection: override > hash(key)
+	part := pickPartition(msg.Key, numPartitions)
+	if msg.Envelope != nil && msg.Envelope.PartitionOverride != nil {
+		po := *msg.Envelope.PartitionOverride
+		if po < 0 || po >= numPartitions {
+			return errors.New("partition_override out of range")
+		}
+		part = po
+	}
+
+	// Compute slowest ack only if we need it
+	slowest := int64(-1)
+	if b.maxPartitionMsgs > 0 || b.maxPartitionBytes > 0 {
+		slowest = b.slowestAckLocked(topic, part)
+	}
+
+	// 1) message-count cap
+	if b.maxPartitionMsgs > 0 {
+		buffered := bufferedCount(ts.partitions[part], slowest)
+		if buffered >= b.maxPartitionMsgs {
+			return &ProducerOverloadError{
+				Reason:     "partition_buffer_full",
+				RetryAfter: 1 * time.Second,
+				Cause:      ErrBackpressure,
+			}
+		}
+	}
+
+	// 2) bytes cap
+	if b.maxPartitionBytes > 0 {
+		bufferedBytes := bufferedBytesCount(ts.partitions[part], slowest)
+		bufferedBytes += len(msg.Key) + len(msg.Value)
+
+		if bufferedBytes >= b.maxPartitionBytes {
+			return &ProducerOverloadError{
+				Reason:     "partition_buffer_bytes_full",
+				RetryAfter: 1 * time.Second,
+				Cause:      ErrBackpressure,
+			}
+		}
+	}
+
+	msg.Offset = ts.nextOffset
+	msg.Partition = part
+
+	// WAL append first (if configured)
+	if b.wal != nil {
+		entry := storage.Entry{
+			Type:      storage.RecordTypeMessage,
+			Topic:     topic,
+			Partition: part,
+			Offset:    msg.Offset,
+			Key:       msg.Key,
+			Value:     msg.Value,
+		}
+
+		// routing metadata
+		if msg.Routing != nil {
+			entry.RoutingLabel = msg.Routing.Label
+			entry.RoutingMeta = msg.Routing.Meta
+		}
+
+		// envelope fields
+		if msg.Envelope != nil {
+			entry.RunID = msg.Envelope.RunID
+			entry.StepID = msg.Envelope.StepID
+			entry.ParentStepID = msg.Envelope.ParentStepID
+			entry.Labels = msg.Envelope.Labels
+
+			entry.TargetTopic = msg.Envelope.TargetTopic
+			entry.PartitionOverride = msg.Envelope.PartitionOverride
+
+			entry.IdempotencyKey = msg.Envelope.IdempotencyKey
+			entry.Deadline = msg.Envelope.Deadline
+
+			if msg.Envelope.RetryPolicy != nil {
+				entry.RetryMaxAttempts = msg.Envelope.RetryPolicy.MaxAttempts
+				entry.RetryBackoffMs = msg.Envelope.RetryPolicy.BackoffMs
+				entry.RetryMaxBackoffMs = msg.Envelope.RetryPolicy.MaxBackoffMs
+			}
+
+			entry.TenantID = msg.Envelope.TenantID
+		}
+
+		if err := b.wal.Append(entry); err != nil {
+			return err
+		}
+	}
+
+	// Commit to in-memory state
+	ts.nextOffset++
+	ts.partitions[part] = append(ts.partitions[part], msg)
+
+	// Deliver what we can
+	b.dispatchLocked(topic)
 
 	return nil
 }
