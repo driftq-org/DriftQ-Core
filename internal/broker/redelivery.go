@@ -41,9 +41,43 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 				continue
 			}
 
-			for _, inflight := range byPart {
-				for _, e := range inflight {
+			for partition, inflight := range byPart {
+				for offset, e := range inflight {
+					// Not yet timed out
 					if now.Sub(e.SentAt) < b.ackTimeout {
+						continue
+					}
+
+					// Retry scheduling gate
+					if !e.NextDeliverAt.IsZero() && now.Before(e.NextDeliverAt) {
+						continue
+					}
+
+					// Optional retry policy from envelope
+					var rp *RetryPolicy
+					if e.Msg.Envelope != nil {
+						rp = e.Msg.Envelope.RetryPolicy
+					}
+
+					// Stop retrying once MaxAttempts is reached (temporary behavior until I add DLQ!!)
+					if rp != nil && rp.MaxAttempts > 0 && e.Attempts >= rp.MaxAttempts {
+						// 1) Remove from inflight so we stop redelivering it
+						delete(inflight, offset)
+
+						// 2) Advance consumer offset so it won’t be dispatched again
+						if _, ok := b.consumerOffsets[topic]; !ok {
+							b.consumerOffsets[topic] = make(map[string]map[int]int64)
+						}
+
+						if _, ok := b.consumerOffsets[topic][group]; !ok {
+							b.consumerOffsets[topic][group] = make(map[int]int64)
+						}
+
+						cur := b.consumerOffsets[topic][group][partition]
+						if offset > cur {
+							b.consumerOffsets[topic][group][partition] = offset
+						}
+
 						continue
 					}
 
@@ -52,14 +86,23 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 					ch := chans[idx]
 
-					// update inflight bookkeeping => SOURCE OF TRUTH :)
+					// update inflight bookkeeping (source of truth)
 					e.SentAt = now
 					e.Attempts++
 
-					// IMPORTANT: send message with updated attempts
+					// Backoff scheduling (for the next eligible retry send time)
+					if rp != nil && (rp.BackoffMs > 0 || rp.MaxBackoffMs > 0) {
+						retryNumber := e.Attempts - 1 // attempt=2 => retry#1, attempt=3 => retry#2 ...
+						backoff := computeBackoff(rp, retryNumber)
+						e.NextDeliverAt = now.Add(backoff)
+					} else {
+						e.NextDeliverAt = time.Time{}
+					}
+
+					// Send message with updated attempts
 					m := e.Msg
 					m.Attempts = e.Attempts
-					e.Msg = m // keep stored copy consistent too
+					e.Msg = m
 
 					go func(ch chan Message, m Message) {
 						defer func() { _ = recover() }()
