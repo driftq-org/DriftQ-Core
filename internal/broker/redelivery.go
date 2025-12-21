@@ -3,6 +3,8 @@ package broker
 import (
 	"context"
 	"time"
+
+	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
 func (b *InMemoryBroker) StartRedeliveryLoop(ctx context.Context) {
@@ -48,12 +50,36 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						continue
 					}
 
-					// If nobody explicitly Nack'ed with a reason, mark a timeout reason. Don't overwrite a real failure reason like "boom"
+					// If it timed out without an explicit Nack, record ack_timeout as last_error
+					// But don't overwrite a real error reason (e.g. "boom") if one already exists
 					if e.LastError == "" {
 						e.LastError = "ack_timeout"
+
+						// update stored msg copy too to keep stuff consistent
 						m := e.Msg
-						m.LastError = e.LastError
+						m.LastError = "ack_timeout"
 						e.Msg = m
+
+						// update retryState map (so dispatch can seed after restart)
+						rs := b.ensureRetryState(topic, group, partition)
+						rs[offset] = &retryStateEntry{
+							LastError:   "ack_timeout",
+							LastErrorAt: now,
+						}
+
+						// persist to WAL
+						if b.wal != nil {
+							at := now
+							_ = b.wal.Append(storage.Entry{
+								Type:        storage.RecordTypeRetryState,
+								Topic:       topic,
+								Group:       group,
+								Partition:   partition,
+								Offset:      offset,
+								LastError:   "ack_timeout",
+								LastErrorAt: &at,
+							})
+						}
 					}
 
 					// Retry scheduling gate
@@ -96,7 +122,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						e.NextDeliverAt = time.Time{}
 					}
 
-					// Send message with updated attempts
+					// Send message with updated attempts + last_error
 					m := e.Msg
 					m.Attempts = e.Attempts
 					m.LastError = e.LastError
