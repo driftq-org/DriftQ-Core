@@ -64,19 +64,8 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						// 1) Remove from inflight so we stop redelivering it
 						delete(inflight, offset)
 
-						// 2) Advance consumer offset so it won’t be dispatched again
-						if _, ok := b.consumerOffsets[topic]; !ok {
-							b.consumerOffsets[topic] = make(map[string]map[int]int64)
-						}
-
-						if _, ok := b.consumerOffsets[topic][group]; !ok {
-							b.consumerOffsets[topic][group] = make(map[int]int64)
-						}
-
-						cur := b.consumerOffsets[topic][group][partition]
-						if offset > cur {
-							b.consumerOffsets[topic][group][partition] = offset
-						}
+						// Move the offset forward and PERSIST it to the WAL so a restart doesn’t bring this message back to life
+						_ = b.advanceOffsetLocked(topic, group, partition, offset)
 
 						continue
 					}
