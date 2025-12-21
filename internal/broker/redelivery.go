@@ -45,6 +45,11 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 
 			for partition, inflight := range byPart {
 				for offset, e := range inflight {
+					if e == nil {
+						delete(inflight, offset)
+						continue
+					}
+
 					// Not yet timed out
 					if now.Sub(e.SentAt) < b.ackTimeout {
 						continue
@@ -57,13 +62,13 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 
 						// update stored msg copy too to keep stuff consistent
 						m := e.Msg
-						m.LastError = "ack_timeout"
+						m.LastError = e.LastError
 						e.Msg = m
 
 						// update retryState map (so dispatch can seed after restart)
 						rs := b.ensureRetryState(topic, group, partition)
 						rs[offset] = &retryStateEntry{
-							LastError:   "ack_timeout",
+							LastError:   e.LastError,
 							LastErrorAt: now,
 						}
 
@@ -76,7 +81,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 								Group:       group,
 								Partition:   partition,
 								Offset:      offset,
-								LastError:   "ack_timeout",
+								LastError:   e.LastError,
 								LastErrorAt: &at,
 							})
 						}
@@ -93,13 +98,47 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						rp = e.Msg.Envelope.RetryPolicy
 					}
 
-					// Stop retrying once MaxAttempts is reached (temporary behavior until I add DLQ!!)
+					// DLQ routing when MaxAttempts reached (STRICT: no drop unless DLQ publish succeeds)
 					if rp != nil && rp.MaxAttempts > 0 && e.Attempts >= rp.MaxAttempts {
-						// 1) Remove from inflight so we stop redelivering it
+						// Build a fresh message that includes the latest attempt/error state
+						dlqMsg := e.Msg
+						dlqMsg.Attempts = e.Attempts
+						dlqMsg.LastError = e.LastError
+
+						// 1) Publish to DLQ
+						if err := b.publishToDLQLocked(context.Background(), topic, dlqMsg); err != nil {
+							// IMPORTANT: preserve original error, append DLQ failure info
+							e.LastError = appendLastError(e.LastError, "dlq_publish_failed: "+err.Error())
+
+							m := e.Msg
+							m.LastError = e.LastError
+							e.Msg = m
+
+							rs := b.ensureRetryState(topic, group, partition)
+							rs[offset] = &retryStateEntry{LastError: e.LastError, LastErrorAt: now}
+							if b.wal != nil {
+								at := now
+								_ = b.wal.Append(storage.Entry{
+									Type:        storage.RecordTypeRetryState,
+									Topic:       topic,
+									Group:       group,
+									Partition:   partition,
+									Offset:      offset,
+									LastError:   e.LastError,
+									LastErrorAt: &at,
+								})
+							}
+							continue
+						}
+
+						// 2) Remove from inflight so we stop redelivering it
 						delete(inflight, offset)
 
-						// Move the offset forward and PERSIST it to the WAL so a restart doesn’t bring this message back to life
+						// 3) Advance offset (persist) so restart won't resurrect it
 						_ = b.advanceOffsetLocked(topic, group, partition, offset)
+
+						// 4) Purge stale retry state for this offset
+						b.purgeRetryStateLocked(topic, group, partition, offset)
 
 						continue
 					}
