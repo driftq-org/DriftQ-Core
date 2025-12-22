@@ -476,7 +476,7 @@ func (b *InMemoryBroker) advanceOffsetLocked(topic, group string, partition int,
 	return nil
 }
 
-func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition int, offset int64, reason string) error {
+func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition int, offset int64, owner string, reason string) error {
 	if topic == "" {
 		return errors.New("topic cannot be empty")
 	}
@@ -491,6 +491,11 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 
 	if offset < 0 {
 		return errors.New("offset cannot be negative")
+	}
+
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return errors.New("owner cannot be empty")
 	}
 
 	// Normalize reason
@@ -521,6 +526,18 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 
 	// Merge with any existing error (keep original + add new detail)
 	merged := appendLastError(e.LastError, reason)
+
+	// If this message is using CONSUMER idempotency, enforce lease fencing:
+	// Only the current lease owner may record the failure
+	if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+		tenantID := e.Msg.Envelope.TenantID
+		idemKey := e.Msg.Envelope.IdempotencyKey
+
+		if err := b.idem.ConsumeFailIfOwner(tenantID, topic, group, idemKey, owner, errors.New(merged)); err != nil {
+			// DO NOT mutate broker state if caller doesn't hold the lease.
+			return err
+		}
+	}
 
 	// 1) Persist retry/failure state (durable) with merged error
 	rs := b.ensureRetryState(topic, group, partition)

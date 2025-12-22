@@ -534,7 +534,13 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.broker.Nack(ctx, topic, group, partition, offset, reason); err != nil {
+	owner := r.URL.Query().Get("owner")
+	if strings.TrimSpace(owner) == "" {
+		http.Error(w, "owner is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.broker.Nack(ctx, topic, group, partition, offset, owner, reason); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
