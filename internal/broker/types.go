@@ -106,6 +106,5 @@ type DLQMetadata struct {
 	Attempts  int    `json:"attempts,omitempty"`
 	LastError string `json:"last_error,omitempty"`
 
-	// Milliseconds since epoch when routed to DLQ
 	RoutedAtMs int64 `json:"routed_at_ms,omitempty"`
 }
