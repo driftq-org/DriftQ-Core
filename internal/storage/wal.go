@@ -122,10 +122,10 @@ func (w *FileWAL) Replay() ([]Entry, error) {
 	var entries []Entry
 	scanner := bufio.NewScanner(w.f)
 
-	// IMPORTANT: bump scanner buffer so larger WAL lines don't fail replay.
-	// Default is ~64K which is easy to exceed with message payloads / envelope metadata.
-	buf := make([]byte, 0, 1024*1024) // 1MB initial
-	scanner.Buffer(buf, 16*1024*1024) // allow up to 16MB per line
+	// ✅ IMPORTANT: increase scanner buffer so large messages (DLQ / big payloads) don't break replay
+	// Default is around 64KB token limit
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024) // allow up to 10MB per line (tune later)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
