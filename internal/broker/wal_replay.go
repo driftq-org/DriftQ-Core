@@ -148,7 +148,13 @@ func envelopeFromEntry(e storage.Entry) *Envelope {
 		e.RetryMaxAttempts != 0 ||
 		e.RetryBackoffMs != 0 ||
 		e.RetryMaxBackoffMs != 0 ||
-		e.TenantID != ""
+		e.TenantID != "" ||
+		e.DLQOriginalTopic != "" ||
+		e.DLQOriginalPartition != 0 ||
+		e.DLQOriginalOffset != 0 ||
+		e.DLQAttempts != 0 ||
+		e.DLQLastError != "" ||
+		e.DLQRoutedAtMs != 0
 
 	if !has {
 		return nil
@@ -171,6 +177,22 @@ func envelopeFromEntry(e storage.Entry) *Envelope {
 			MaxAttempts:  e.RetryMaxAttempts,
 			BackoffMs:    e.RetryBackoffMs,
 			MaxBackoffMs: e.RetryMaxBackoffMs,
+		}
+	}
+
+	if e.DLQOriginalTopic != "" ||
+		e.DLQOriginalPartition != 0 ||
+		e.DLQOriginalOffset != 0 ||
+		e.DLQAttempts != 0 ||
+		e.DLQLastError != "" ||
+		e.DLQRoutedAtMs != 0 {
+		env.DLQ = &DLQMetadata{
+			OriginalTopic:     e.DLQOriginalTopic,
+			OriginalPartition: e.DLQOriginalPartition,
+			OriginalOffset:    e.DLQOriginalOffset,
+			Attempts:          e.DLQAttempts,
+			LastError:         e.DLQLastError,
+			RoutedAtMs:        e.DLQRoutedAtMs,
 		}
 	}
 

@@ -684,6 +684,15 @@ func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Mess
 			}
 
 			entry.TenantID = msg.Envelope.TenantID
+
+			if msg.Envelope.DLQ != nil {
+				entry.DLQOriginalTopic = msg.Envelope.DLQ.OriginalTopic
+				entry.DLQOriginalPartition = msg.Envelope.DLQ.OriginalPartition
+				entry.DLQOriginalOffset = msg.Envelope.DLQ.OriginalOffset
+				entry.DLQAttempts = msg.Envelope.DLQ.Attempts
+				entry.DLQLastError = msg.Envelope.DLQ.LastError
+				entry.DLQRoutedAtMs = msg.Envelope.DLQ.RoutedAtMs
+			}
 		}
 
 		if err := b.wal.Append(entry); err != nil {

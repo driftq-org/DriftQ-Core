@@ -42,6 +42,9 @@ func (b *InMemoryBroker) publishToDLQLocked(ctx context.Context, topic string, m
 	env.TargetTopic = ""
 	env.PartitionOverride = nil
 
+	// IMPORTANT: prevent DLQ-of-DLQ recursion
+	env.RetryPolicy = nil
+
 	env.DLQ = &DLQMetadata{
 		OriginalTopic:     topic,
 		OriginalPartition: msg.Partition,
