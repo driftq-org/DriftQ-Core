@@ -96,6 +96,14 @@ type Envelope struct {
 	TenantID    string       `json:"tenant_id,omitempty"`
 
 	DLQ *DLQMetadata `json:"dlq,omitempty"`
+
+	// DLQ metadata (PR5)
+	DlqOriginalTopic     string `json:"dlq_original_topic,omitempty"`
+	DlqOriginalPartition int    `json:"dlq_original_partition,omitempty"`
+	DlqOriginalOffset    int64  `json:"dlq_original_offset,omitempty"`
+	DlqAttempts          int    `json:"dlq_attempts,omitempty"`
+	DlqLastError         string `json:"dlq_last_error,omitempty"`
+	DlqRoutedAtMs        int64  `json:"dlq_routed_at_ms,omitempty"`
 }
 
 type DLQMetadata struct {
