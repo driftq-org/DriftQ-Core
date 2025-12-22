@@ -53,6 +53,15 @@ type Entry struct {
 
 	TenantID string `json:"tenant_id,omitempty"`
 
+	// DLQ metadata
+	DLQOriginalTopic     string `json:"dlq_original_topic,omitempty"`
+	DLQOriginalPartition int    `json:"dlq_original_partition,omitempty"`
+	DLQOriginalOffset    int64  `json:"dlq_original_offset,omitempty"`
+	DLQAttempts          int    `json:"dlq_attempts,omitempty"`
+	DLQLastError         string `json:"dlq_last_error,omitempty"`
+	DLQRoutedAtMs        int64  `json:"dlq_routed_at_ms,omitempty"`
+
+	// Retry state records (RecordTypeRetryState)
 	LastError   string     `json:"last_error,omitempty"`
 	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
 }
@@ -112,6 +121,11 @@ func (w *FileWAL) Replay() ([]Entry, error) {
 
 	var entries []Entry
 	scanner := bufio.NewScanner(w.f)
+
+	// ✅ IMPORTANT: increase scanner buffer so large messages (DLQ / big payloads) don't break replay
+	// Default is around 64KB token limit
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024) // allow up to 10MB per line (tune later)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()

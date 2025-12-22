@@ -117,7 +117,8 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	}
 
 	// Router hook: routing metadata + optional routing controls (target_topic/partition_override)
-	if b.router != nil {
+	// IMPORTANT: skip routing for DLQ messages (DLQ publish must be deterministic)
+	if b.router != nil && (msg.Envelope == nil || msg.Envelope.DLQ == nil) {
 		decision, err := b.router.Route(ctx, topic, msg)
 		if err == nil {
 			msg.Routing = &RoutingMetadata{
@@ -683,6 +684,15 @@ func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Mess
 			}
 
 			entry.TenantID = msg.Envelope.TenantID
+
+			if msg.Envelope.DLQ != nil {
+				entry.DLQOriginalTopic = msg.Envelope.DLQ.OriginalTopic
+				entry.DLQOriginalPartition = msg.Envelope.DLQ.OriginalPartition
+				entry.DLQOriginalOffset = msg.Envelope.DLQ.OriginalOffset
+				entry.DLQAttempts = msg.Envelope.DLQ.Attempts
+				entry.DLQLastError = msg.Envelope.DLQ.LastError
+				entry.DLQRoutedAtMs = msg.Envelope.DLQ.RoutedAtMs
+			}
 		}
 
 		if err := b.wal.Append(entry); err != nil {

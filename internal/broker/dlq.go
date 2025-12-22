@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 func dlqTopicName(topic string) string {
@@ -22,12 +23,38 @@ func (b *InMemoryBroker) publishToDLQLocked(ctx context.Context, topic string, m
 		if ts, ok := b.topics[topic]; ok && ts != nil && len(ts.partitions) > 0 {
 			partitions = len(ts.partitions)
 		}
-
 		if err := b.createTopicLocked(dlqTopic, partitions); err != nil {
 			return err
 		}
 	}
 
-	// This is minimal payload: original key/value + envelope (optional already present on msg)
+	// Attach DLQ metadata (without breaking original envelope semantics)
+	now := time.Now()
+
+	var env Envelope
+	if msg.Envelope != nil {
+		env = *msg.Envelope // shallow copy
+	} else {
+		env = Envelope{}
+	}
+
+	// IMPORTANT: prevent the DLQ publish from being redirected by envelope routing controls
+	env.TargetTopic = ""
+	env.PartitionOverride = nil
+
+	// IMPORTANT: prevent DLQ-of-DLQ recursion
+	env.RetryPolicy = nil
+
+	env.DLQ = &DLQMetadata{
+		OriginalTopic:     topic,
+		OriginalPartition: msg.Partition,
+		OriginalOffset:    msg.Offset,
+		Attempts:          msg.Attempts,
+		LastError:         msg.LastError,
+		RoutedAtMs:        now.UnixMilli(),
+	}
+
+	msg.Envelope = &env
+
 	return b.produceLocked(ctx, dlqTopic, msg)
 }

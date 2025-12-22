@@ -94,4 +94,17 @@ type Envelope struct {
 
 	RetryPolicy *RetryPolicy `json:"retry_policy,omitempty"`
 	TenantID    string       `json:"tenant_id,omitempty"`
+
+	DLQ *DLQMetadata `json:"dlq,omitempty"`
+}
+
+type DLQMetadata struct {
+	OriginalTopic     string `json:"original_topic,omitempty"`
+	OriginalPartition int    `json:"original_partition,omitempty"`
+	OriginalOffset    int64  `json:"original_offset,omitempty"`
+
+	Attempts  int    `json:"attempts,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+
+	RoutedAtMs int64 `json:"routed_at_ms,omitempty"`
 }

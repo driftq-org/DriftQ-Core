@@ -137,6 +137,9 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 
 func envelopeFromEntry(e storage.Entry) *Envelope {
 	// Decide if we should allocate an envelope at all
+	// DLQ presence: avoid "0 is valid" traps for partition/offset. Our DLQ publisher always sets OriginalTopic, and RoutedAtMs is also a strong signal
+	hasDLQ := e.DLQOriginalTopic != "" || e.DLQRoutedAtMs != 0 || e.DLQLastError != ""
+
 	has := e.RunID != "" ||
 		e.StepID != "" ||
 		e.ParentStepID != "" ||
@@ -148,7 +151,8 @@ func envelopeFromEntry(e storage.Entry) *Envelope {
 		e.RetryMaxAttempts != 0 ||
 		e.RetryBackoffMs != 0 ||
 		e.RetryMaxBackoffMs != 0 ||
-		e.TenantID != ""
+		e.TenantID != "" ||
+		hasDLQ
 
 	if !has {
 		return nil
@@ -171,6 +175,17 @@ func envelopeFromEntry(e storage.Entry) *Envelope {
 			MaxAttempts:  e.RetryMaxAttempts,
 			BackoffMs:    e.RetryBackoffMs,
 			MaxBackoffMs: e.RetryMaxBackoffMs,
+		}
+	}
+
+	if hasDLQ {
+		env.DLQ = &DLQMetadata{
+			OriginalTopic:     e.DLQOriginalTopic,
+			OriginalPartition: e.DLQOriginalPartition,
+			OriginalOffset:    e.DLQOriginalOffset,
+			Attempts:          e.DLQAttempts,
+			LastError:         e.DLQLastError,
+			RoutedAtMs:        e.DLQRoutedAtMs,
 		}
 	}
 
