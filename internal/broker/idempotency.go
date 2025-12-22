@@ -259,9 +259,12 @@ func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner 
 	if key == "" {
 		return false, nil, nil
 	}
-	if lease <= 0 {
-		return false, nil, ErrIdempotencyBadLease
+
+	// Enforce your lease policy (e.g., >= 250ms)
+	if err := validateLease(lease); err != nil {
+		return false, nil, err
 	}
+
 	if owner == "" {
 		owner = "unknown"
 	}
@@ -287,8 +290,9 @@ func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner 
 			return true, st.Result, nil
 
 		case IdemStatusPending:
-			// Someone else holds a valid lease => reject
-			if st.Owner != "" && st.Owner != owner && st.LeaseUntil.After(now) {
+			// Someone else holds a still-valid lease => reject
+			leaseActive := !st.LeaseUntil.IsZero() && now.Before(st.LeaseUntil)
+			if leaseActive && st.Owner != owner {
 				return false, nil, ErrIdempotencyLeaseHeld
 			}
 
@@ -301,7 +305,15 @@ func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner 
 			return false, nil, nil
 
 		case IdemStatusFailed:
-			// Allow retry: FAILED -> PENDING with fresh lease
+			st.Status = IdemStatusPending
+			st.LastError = ""
+			st.Owner = owner
+			st.LeaseUntil = now.Add(lease)
+			st.UpdatedAt = now
+			s.items[k] = st
+			return false, nil, nil
+
+		default:
 			st.Status = IdemStatusPending
 			st.LastError = ""
 			st.Owner = owner
@@ -327,8 +339,12 @@ func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner 
 		return nil
 	}
 
-	if lease <= 0 {
-		return ErrIdempotencyBadLease
+	if err := validateLease(lease); err != nil {
+		return err
+	}
+
+	if owner == "" {
+		owner = "unknown"
 	}
 
 	now := time.Now()
@@ -351,7 +367,6 @@ func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner 
 		return ErrIdempotencyNotFound
 	}
 
-	// Must still be pending and owned by us and not expired
 	if st.Status != IdemStatusPending {
 		return ErrIdempotencyLeaseLost
 	}
@@ -360,13 +375,14 @@ func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner 
 		return ErrIdempotencyLeaseHeld
 	}
 
-	if st.LeaseUntil.Before(now) {
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
 	}
 
 	st.LeaseUntil = now.Add(lease)
 	st.UpdatedAt = now
 	s.items[k] = st
+
 	return nil
 }
 
@@ -399,7 +415,6 @@ func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, own
 		return ErrIdempotencyNotFound
 	}
 
-	// If it's already committed, treat as success
 	if st.Status == IdemStatusCommitted {
 		return nil
 	}
@@ -408,21 +423,21 @@ func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, own
 		return ErrIdempotencyLeaseLost
 	}
 
-	// Fence: only owner with a live lease may commit
 	if st.Owner != owner {
 		return ErrIdempotencyLeaseHeld
 	}
 
-	if st.LeaseUntil.Before(now) {
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
 	}
 
 	s.items[k] = IdempotencyStatus{
 		Status:     IdemStatusCommitted,
 		Result:     result,
+		LastError:  "",
 		UpdatedAt:  now,
 		Owner:      "",
-		LeaseUntil: time.Time{}, // IMPORTANT: clear lease info once committed
+		LeaseUntil: time.Time{},
 	}
 
 	return nil
@@ -431,6 +446,10 @@ func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, own
 func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner string, cause error) error {
 	if key == "" {
 		return nil
+	}
+
+	if owner == "" {
+		owner = "unknown"
 	}
 
 	msg := ""
@@ -458,7 +477,6 @@ func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner
 		return ErrIdempotencyNotFound
 	}
 
-	// Fence: only owner can mark failure while pending
 	if st.Status != IdemStatusPending {
 		return ErrIdempotencyLeaseLost
 	}
@@ -467,15 +485,18 @@ func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner
 		return ErrIdempotencyLeaseHeld
 	}
 
-	if st.LeaseUntil.Before(now) {
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
 	}
 
 	s.items[k] = IdempotencyStatus{
-		Status:    IdemStatusFailed,
-		LastError: msg,
-		UpdatedAt: now,
-		Owner:     owner,
+		Status:     IdemStatusFailed,
+		LastError:  msg,
+		UpdatedAt:  now,
+		Owner:      "",
+		LeaseUntil: time.Time{},
+		Result:     nil,
 	}
+
 	return nil
 }

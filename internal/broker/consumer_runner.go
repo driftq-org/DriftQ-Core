@@ -7,15 +7,12 @@ import (
 
 type ConsumerHandler func(ctx context.Context, msg Message) ([]byte, error)
 
-// RunConsumerWithIdempotency runs a consumer loop that enforces consumer-boundary idempotency
-// using Option B (lease + fencing via commit-if-owner).
 func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, group, owner string, lease time.Duration, handler ConsumerHandler) error {
 	if handler == nil {
 		return nil
 	}
 
-	// Enforce valid lease once, before we even start consuming.
-	// (Your store methods also validate, but we should not rely on that.)
+	// If we're running Option-B, the lease must be sane. Validate once, up front.
 	if err := validateLease(lease); err != nil {
 		return err
 	}
@@ -31,19 +28,19 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 
 	helper := b.IdempotencyHelper()
 
-	// Renew at half-lease, but keep it sane:
-	// - never 0
-	// - never too tiny (would thrash)
-	// - never larger than half the lease (or you risk expiring before renew)
-	renewEvery := lease / 2
+	renewEvery := lease / 3
 	const minRenew = 100 * time.Millisecond
 	if renewEvery < minRenew {
 		renewEvery = minRenew
 	}
+
 	if renewEvery >= lease {
-		// This should never happen with validateLease, but belt+suspenders
 		renewEvery = lease / 2
 		if renewEvery <= 0 {
+			renewEvery = minRenew
+		}
+
+		if renewEvery >= lease {
 			renewEvery = minRenew
 		}
 	}
@@ -58,40 +55,46 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 				return nil
 			}
 
-			// If no idempotency requested, just run handler normally.
+			// Fast path: no helper or no idempotency requested on this message
 			if helper == nil || msg.Envelope == nil || msg.Envelope.IdempotencyKey == "" {
-				if _, err := handler(ctx, msg); err != nil {
-					_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, err.Error())
+				if _, herr := handler(ctx, msg); herr != nil {
+					_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, herr.Error())
 					continue
 				}
 				_ = b.Ack(ctx, topic, group, msg.Partition, msg.Offset)
 				continue
 			}
 
-			// 1) Claim lease (Option B)
-			alreadyDone, _, err := helper.store.ConsumeBeginLease(
-				msg.Envelope.TenantID, topic, group, msg.Envelope.IdempotencyKey, owner, lease,
-			)
-			if err != nil {
-				if err == ErrIdempotencyLeaseHeld {
-					_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, "idem_lease_held")
+			// Copy fields we will reuse (avoid relying on msg/envelope in goroutines)
+			tenantID := msg.Envelope.TenantID
+			idKey := msg.Envelope.IdempotencyKey
+			part := msg.Partition
+			off := msg.Offset
+
+			// 1) Claim lease
+			alreadyDone, _, berr := helper.store.ConsumeBeginLease(tenantID, topic, group, idKey, owner, lease)
+			if berr != nil {
+				if berr == ErrIdempotencyLeaseHeld {
+					_ = b.Nack(ctx, topic, group, part, off, owner, "idem_lease_held")
 					continue
 				}
-				_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, "idem_begin_failed: "+err.Error())
+				_ = b.Nack(ctx, topic, group, part, off, owner, "idem_begin_failed: "+berr.Error())
 				continue
 			}
 
 			if alreadyDone {
-				_ = b.Ack(ctx, topic, group, msg.Partition, msg.Offset)
+				_ = b.Ack(ctx, topic, group, part, off)
 				continue
 			}
 
 			// 2) Run handler while renewing lease
 			hctx, cancel := context.WithCancel(ctx)
+			deferCancel := true
+
 			renewErr := make(chan error, 1)
 			done := make(chan struct{})
 
-			go func() {
+			go func(tenantID, topic, group, idKey, owner string) {
 				defer close(done)
 
 				t := time.NewTicker(renewEvery)
@@ -102,10 +105,8 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 					case <-hctx.Done():
 						return
 					case <-t.C:
-						if err := helper.store.ConsumeRenewLease(
-							msg.Envelope.TenantID, topic, group, msg.Envelope.IdempotencyKey, owner, lease,
-						); err != nil {
-							// Best-effort signal; non-blocking if handler already ended.
+						if err := helper.store.ConsumeRenewLease(tenantID, topic, group, idKey, owner, lease); err != nil {
+							// non-blocking signal
 							select {
 							case renewErr <- err:
 							default:
@@ -115,39 +116,43 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 						}
 					}
 				}
-			}()
+			}(tenantID, topic, group, idKey, owner)
 
 			res, handlerErr := handler(hctx, msg)
 
-			// stop renew loop
+			// stop renew loop + wait it out
 			cancel()
+			deferCancel = false
 			<-done
 
+			// If renew failed, we definitely don't Ack.
 			select {
-			case err := <-renewErr:
-				// lease lost while we were running — do NOT Ack.
-				_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, "idem_lease_lost: "+err.Error())
+			case rerr := <-renewErr:
+				_ = b.Nack(ctx, topic, group, part, off, owner, "idem_lease_lost: "+rerr.Error())
 				continue
 			default:
 			}
 
 			if handlerErr != nil {
-				_ = helper.store.ConsumeFailIfOwner(
-					msg.Envelope.TenantID, topic, group, msg.Envelope.IdempotencyKey, owner, handlerErr,
-				)
-				_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, handlerErr.Error())
+				// Mark failure *only if owner*
+				if ferr := helper.store.ConsumeFailIfOwner(tenantID, topic, group, idKey, owner, handlerErr); ferr != nil {
+					_ = b.Nack(ctx, topic, group, part, off, owner, "idem_fail_failed: "+ferr.Error())
+					continue
+				}
+				_ = b.Nack(ctx, topic, group, part, off, owner, handlerErr.Error())
 				continue
 			}
 
 			// 3) Commit-if-owner; only Ack if commit succeeds
-			if err := helper.store.ConsumeCommitIfOwner(
-				msg.Envelope.TenantID, topic, group, msg.Envelope.IdempotencyKey, owner, res,
-			); err != nil {
-				_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, "idem_commit_failed: "+err.Error())
+			if cerr := helper.store.ConsumeCommitIfOwner(tenantID, topic, group, idKey, owner, res); cerr != nil {
+				_ = b.Nack(ctx, topic, group, part, off, owner, "idem_commit_failed: "+cerr.Error())
 				continue
 			}
 
-			_ = b.Ack(ctx, topic, group, msg.Partition, msg.Offset)
+			_ = b.Ack(ctx, topic, group, part, off)
+
+			// In case we ever add defers above, keep this pattern safe
+			_ = deferCancel
 		}
 	}
 }
