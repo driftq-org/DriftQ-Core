@@ -516,18 +516,15 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	partitionStr := r.URL.Query().Get("partition")
 	reason := r.URL.Query().Get("reason")
 
-	if partitionStr == "" {
-		partitionStr = "0" // default for now
+	// CHANGE: require partition (no default)
+	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
+		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
 		http.Error(w, "invalid partition", http.StatusBadRequest)
-		return
-	}
-
-	if topic == "" || group == "" || offsetStr == "" {
-		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
 		return
 	}
 
