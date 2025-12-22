@@ -534,3 +534,209 @@ func (h *IdempotencyConsumerHelper) MarkFailure(topic string, msg Message, cause
 
 	h.store.MarkFailure(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, cause)
 }
+
+func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner string, lease time.Duration) (alreadyDone bool, priorResult []byte, err error) {
+	if key == "" {
+		return false, nil, nil
+	}
+
+	if lease <= 0 {
+		return false, nil, ErrIdempotencyBadLease
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	if st, ok := s.items[k]; ok {
+		switch st.Status {
+		case IdemStatusCommitted:
+			return true, st.Result, nil
+
+		case IdemStatusPending:
+			// If someone else holds a valid lease, reject!!
+			if st.Owner != "" && st.Owner != owner && st.LeaseUntil.After(now) {
+				return false, nil, ErrIdempotencyLeaseHeld
+			}
+
+			// So here either lease expired, or same owner renewing/continuing
+			st.Owner = owner
+			st.LeaseUntil = now.Add(lease)
+			st.UpdatedAt = now
+			s.items[k] = st
+			return false, nil, nil
+
+		case IdemStatusFailed:
+			// Allow retry: replace FAILED -> PENDING with a fresh lease
+		}
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:     IdemStatusPending,
+		UpdatedAt:  now,
+		Owner:      owner,
+		LeaseUntil: now.Add(lease),
+	}
+
+	return false, nil, nil
+}
+
+func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner string, lease time.Duration) error {
+	if key == "" {
+		return nil
+	}
+
+	if lease <= 0 {
+		return ErrIdempotencyBadLease
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	// Must still be pending and owned by us and not expired
+	if st.Status != IdemStatusPending {
+		return ErrIdempotencyLeaseLost
+	}
+
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.Before(now) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	st.LeaseUntil = now.Add(lease)
+	st.UpdatedAt = now
+	s.items[k] = st
+	return nil
+}
+
+func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, owner string, result []byte) error {
+	if key == "" {
+		return nil
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	// If it's already committed, treat as success
+	if st.Status == IdemStatusCommitted {
+		return nil
+	}
+
+	// Fence: only owner with a live lease may commit
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.Before(now) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:    IdemStatusCommitted,
+		Result:    result,
+		UpdatedAt: now,
+		Owner:     owner,
+		// LeaseUntil intentionally irrelevant once committed
+	}
+	return nil
+}
+
+func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner string, cause error) error {
+	if key == "" {
+		return nil
+	}
+
+	msg := ""
+	if cause != nil {
+		msg = cause.Error()
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	// Fence: only owner can mark failure while pending
+	if st.Status != IdemStatusPending {
+		return ErrIdempotencyLeaseLost
+	}
+
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.Before(now) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:    IdemStatusFailed,
+		LastError: msg,
+		UpdatedAt: now,
+		Owner:     owner,
+	}
+	return nil
+}
