@@ -153,9 +153,17 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 }
 
 func validateLease(lease time.Duration) error {
-	if lease < 250*time.Millisecond {
+	const minLease = 250 * time.Millisecond
+	const maxLease = 10 * time.Minute // can/should tweak this
+
+	if lease <= 0 {
 		return ErrIdempotencyBadLease
 	}
-
+	if lease < minLease {
+		return ErrIdempotencyBadLease
+	}
+	if lease > maxLease {
+		return ErrIdempotencyBadLease
+	}
 	return nil
 }
