@@ -96,22 +96,16 @@ type Envelope struct {
 	TenantID    string       `json:"tenant_id,omitempty"`
 
 	DLQ *DLQMetadata `json:"dlq,omitempty"`
-
-	// DLQ metadata (PR5)
-	DlqOriginalTopic     string `json:"dlq_original_topic,omitempty"`
-	DlqOriginalPartition int    `json:"dlq_original_partition,omitempty"`
-	DlqOriginalOffset    int64  `json:"dlq_original_offset,omitempty"`
-	DlqAttempts          int    `json:"dlq_attempts,omitempty"`
-	DlqLastError         string `json:"dlq_last_error,omitempty"`
-	DlqRoutedAtMs        int64  `json:"dlq_routed_at_ms,omitempty"`
 }
 
 type DLQMetadata struct {
-	SourceTopic     string `json:"source_topic,omitempty"`
-	SourceGroup     string `json:"source_group,omitempty"`
-	SourcePartition int    `json:"source_partition,omitempty"`
-	SourceOffset    int64  `json:"source_offset,omitempty"`
+	OriginalTopic     string `json:"original_topic,omitempty"`
+	OriginalPartition int    `json:"original_partition,omitempty"`
+	OriginalOffset    int64  `json:"original_offset,omitempty"`
 
 	Attempts  int    `json:"attempts,omitempty"`
 	LastError string `json:"last_error,omitempty"`
+
+	// Milliseconds since epoch when routed to DLQ
+	RoutedAtMs int64 `json:"routed_at_ms,omitempty"`
 }

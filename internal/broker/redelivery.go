@@ -105,6 +105,24 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						dlqMsg.Attempts = e.Attempts
 						dlqMsg.LastError = e.LastError
 
+						var envCopy *Envelope
+						if e.Msg.Envelope != nil {
+							tmp := *e.Msg.Envelope // do not forget that this is a shallow copy (enough for our DLQ metadata use)
+							envCopy = &tmp
+						} else {
+							envCopy = &Envelope{}
+						}
+
+						envCopy.DLQ = &DLQMetadata{
+							OriginalTopic:     topic,
+							OriginalPartition: partition,
+							OriginalOffset:    offset,
+							Attempts:          e.Attempts,
+							LastError:         e.LastError,
+							RoutedAtMs:        now.UnixMilli(),
+						}
+						dlqMsg.Envelope = envCopy
+
 						// 1) Publish to DLQ
 						if err := b.publishToDLQLocked(context.Background(), topic, dlqMsg); err != nil {
 							// IMPORTANT: preserve original error, append DLQ failure info
