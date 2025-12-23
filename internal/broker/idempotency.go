@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
 const (
@@ -58,9 +60,14 @@ type IdempotencyStore struct {
 	mu    sync.Mutex
 	ttl   time.Duration
 	items map[idempotencyKey]IdempotencyStatus
+	wal   storage.WAL
 }
 
 func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
+	return NewIdempotencyStoreWithWAL(nil, ttl)
+}
+
+func NewIdempotencyStoreWithWAL(wal storage.WAL, ttl time.Duration) *IdempotencyStore {
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
@@ -68,6 +75,7 @@ func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
 	return &IdempotencyStore{
 		ttl:   ttl,
 		items: make(map[idempotencyKey]IdempotencyStatus),
+		wal:   wal,
 	}
 }
 
@@ -429,6 +437,32 @@ func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, own
 
 	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
+	}
+
+	if s.wal != nil {
+		updatedAt := now
+		lu := st.LeaseUntil
+
+		entry := storage.Entry{
+			Type:              storage.RecordTypeConsumeIdempotency,
+			TenantID:          tenantID,
+			Topic:             topic,
+			Group:             group,
+			IdempotencyKey:    key,
+			IdempotencyScope:  IdemScopeConsume,
+			IdempotencyStatus: IdemStatusCommitted,
+
+			LeaseOwner: owner,
+			LeaseUntil: &lu,
+
+			Result:    result,
+			LastError: "",
+			UpdatedAt: &updatedAt,
+		}
+
+		if err := s.wal.Append(entry); err != nil {
+			return err
+		}
 	}
 
 	s.items[k] = IdempotencyStatus{
