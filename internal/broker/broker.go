@@ -498,7 +498,6 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		return errors.New("owner cannot be empty")
 	}
 
-	// Normalize reason
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "nack"
@@ -527,18 +526,6 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 	// Merge with any existing error (keep original + add new detail)
 	merged := appendLastError(e.LastError, reason)
 
-	// If this message is using CONSUMER idempotency, enforce lease fencing:
-	// Only the current lease owner may record the failure
-	if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
-		tenantID := e.Msg.Envelope.TenantID
-		idemKey := e.Msg.Envelope.IdempotencyKey
-
-		if err := b.idem.ConsumeFailIfOwner(tenantID, topic, group, idemKey, owner, errors.New(merged)); err != nil {
-			// DO NOT mutate broker state if caller doesn't hold the lease.
-			return err
-		}
-	}
-
 	// 1) Persist retry/failure state (durable) with merged error
 	rs := b.ensureRetryState(topic, group, partition)
 	rs[offset] = &retryStateEntry{
@@ -547,8 +534,8 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 	}
 
 	if b.wal != nil {
-		at := now // addressable copy
-		entry := storage.Entry{
+		at := now
+		if err := b.wal.Append(storage.Entry{
 			Type:        storage.RecordTypeRetryState,
 			Topic:       topic,
 			Group:       group,
@@ -556,9 +543,7 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 			Offset:      offset,
 			LastError:   merged,
 			LastErrorAt: &at,
-		}
-
-		if err := b.wal.Append(entry); err != nil {
+		}); err != nil {
 			return err
 		}
 	}
@@ -569,11 +554,42 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 	m.LastError = merged
 	e.Msg = m
 
-	// 3) Make it eligible for immediate redelivery (NOT an ack)
+	// 3) Best-effort idempotency failure mark
+	if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+		tenantID := e.Msg.Envelope.TenantID
+		idk := e.Msg.Envelope.IdempotencyKey
+
+		if err := b.idem.ConsumeFailIfOwner(tenantID, topic, group, idk, owner, errors.New(reason)); err != nil && err != ErrIdempotencyNotFound {
+			// Don't fail the nack; just make it visible
+			merged2 := appendLastError(merged, "idem_fail_failed: "+err.Error())
+
+			e.LastError = merged2
+			m := e.Msg
+			m.LastError = merged2
+			e.Msg = m
+
+			// Keep retryState consistent (best-effort WAL append)
+			rs[offset] = &retryStateEntry{LastError: merged2, LastErrorAt: now}
+			if b.wal != nil {
+				at := now
+				_ = b.wal.Append(storage.Entry{
+					Type:        storage.RecordTypeRetryState,
+					Topic:       topic,
+					Group:       group,
+					Partition:   partition,
+					Offset:      offset,
+					LastError:   merged2,
+					LastErrorAt: &at,
+				})
+			}
+		}
+	}
+
+	// 4) Make it eligible for immediate redelivery (NOT an ack)
 	e.NextDeliverAt = time.Time{}
 	e.SentAt = now.Add(-b.ackTimeout)
 
-	// Optional: resend now
+	// 5) Optional: resend now
 	b.redeliverExpiredLocked()
 
 	return nil
