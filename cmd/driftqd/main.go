@@ -244,13 +244,23 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			anySet = true
 		}
 
+		// Support tenant_id (primary) + tenant (alias)
 		if v := strings.TrimSpace(q.Get("tenant_id")); v != "" {
+			env.TenantID = v
+			anySet = true
+		} else if v := strings.TrimSpace(q.Get("tenant")); v != "" {
 			env.TenantID = v
 			anySet = true
 		}
 
-		if v := strings.TrimSpace(q.Get("idempotency_key")); v != "" {
-			env.IdempotencyKey = v
+		// Support idempotency_key (primary) + idem_key (alias)
+		idem := strings.TrimSpace(q.Get("idempotency_key"))
+		if idem == "" {
+			idem = strings.TrimSpace(q.Get("idem_key"))
+		}
+
+		if idem != "" {
+			env.IdempotencyKey = idem
 			anySet = true
 		}
 
@@ -476,18 +486,15 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
 
-	if partitionStr == "" {
-		partitionStr = "0" // default ONLY for now
+	// CHANGE: require partition (no default)
+	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
+		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
 		http.Error(w, "invalid partition", http.StatusBadRequest)
-		return
-	}
-
-	if topic == "" || group == "" || offsetStr == "" {
-		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
 		return
 	}
 
@@ -517,20 +524,22 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
+	owner := r.URL.Query().Get("owner")
 	reason := r.URL.Query().Get("reason")
 
-	if partitionStr == "" {
-		partitionStr = "0" // default for now
+	if strings.TrimSpace(owner) == "" {
+		http.Error(w, "owner is required", http.StatusBadRequest)
+		return
+	}
+
+	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
+		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
 		http.Error(w, "invalid partition", http.StatusBadRequest)
-		return
-	}
-
-	if topic == "" || group == "" || offsetStr == "" {
-		http.Error(w, "topic, group, and offset are required", http.StatusBadRequest)
 		return
 	}
 
@@ -540,7 +549,7 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.broker.Nack(ctx, topic, group, partition, offset, reason); err != nil {
+	if err := s.broker.Nack(ctx, topic, group, partition, offset, owner, reason); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

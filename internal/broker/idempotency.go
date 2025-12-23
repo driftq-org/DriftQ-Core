@@ -7,12 +7,23 @@ import (
 )
 
 const (
+	IdemScopeProduce = "produce"
+	IdemScopeConsume = "consume"
+)
+
+const (
 	IdemStatusPending   = "PENDING"
 	IdemStatusCommitted = "COMMITTED"
 	IdemStatusFailed    = "FAILED"
 )
 
-var ErrIdempotencyInFlight = errors.New("idempotency: key already in-flight")
+var (
+	ErrIdempotencyInFlight  = errors.New("idempotency: key already in-flight")
+	ErrIdempotencyLeaseHeld = errors.New("idempotency: lease held by another worker")
+	ErrIdempotencyLeaseLost = errors.New("idempotency: lease lost or expired")
+	ErrIdempotencyNotFound  = errors.New("idempotency: key not found")
+	ErrIdempotencyBadLease  = errors.New("idempotency: invalid lease duration")
+)
 
 type IdempotencyConsumerHelper struct {
 	store *IdempotencyStore
@@ -23,20 +34,26 @@ type IdempotencyStatus struct {
 	Result    []byte
 	LastError string
 	UpdatedAt time.Time
+
+	// consumer-lease fields (only for Scope="consume")
+	Owner      string
+	LeaseUntil time.Time
 }
 
 type idempotencyKey struct {
+	Scope    string // "produce" | "consume"
 	TenantID string
 	Topic    string
+	Group    string // only for consumer scope
 	Key      string
 }
 
-// IdempotencyStore is a tiny in-memory dedupe map.
+// IdempotencyStore is a tiny in-memory dedupe map
 // MVP behavior:
-// - Begin() marks (tenant,topic,idKey) as PENDING atomically.
-// - Commit() marks it COMMITTED.
-// - Fail() marks it FAILED.
-// - Entries expire after ttl (to avoid unbounded growth).
+// - Begin() marks (tenant,topic,idKey) as PENDING atomically
+// - Commit() marks it COMMITTED
+// - Fail() marks it FAILED
+// - Entries expire after ttl (to avoid unbounded growth)
 type IdempotencyStore struct {
 	mu    sync.Mutex
 	ttl   time.Duration
@@ -47,13 +64,14 @@ func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
+
 	return &IdempotencyStore{
 		ttl:   ttl,
 		items: make(map[idempotencyKey]IdempotencyStatus),
 	}
 }
 
-// Begin attempts to start a new idempotent operation
+// Begin attempts to start a new idempotent operation (PRODUCER SCOPE)
 // Returns:
 // - alreadyCommitted=true if this key was already committed (caller should treat as success and skip work)
 // - err=ErrIdempotencyInFlight if currently pending (caller should reject to avoid duplicates)
@@ -68,7 +86,14 @@ func (s *IdempotencyStore) Begin(tenantID, topic, key string) (alreadyCommitted 
 
 	s.cleanupLocked(time.Now())
 
-	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	k := idempotencyKey{
+		Scope:    IdemScopeProduce,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    "",
+		Key:      key,
+	}
+
 	if st, ok := s.items[k]; ok {
 		switch st.Status {
 		case IdemStatusCommitted:
@@ -76,8 +101,7 @@ func (s *IdempotencyStore) Begin(tenantID, topic, key string) (alreadyCommitted 
 		case IdemStatusPending:
 			return false, ErrIdempotencyInFlight
 		case IdemStatusFailed:
-			// For MVP: allow retry by replacing FAILED with PENDING
-			// (later we can respect RetryPolicy/backoff)
+			// allow retry by replacing FAILED with PENDING
 		}
 	}
 
@@ -97,7 +121,14 @@ func (s *IdempotencyStore) Commit(tenantID, topic, key string, result []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	k := idempotencyKey{
+		Scope:    IdemScopeProduce,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    "",
+		Key:      key,
+	}
+
 	s.items[k] = IdempotencyStatus{
 		Status:    IdemStatusCommitted,
 		Result:    result,
@@ -118,7 +149,14 @@ func (s *IdempotencyStore) Fail(tenantID, topic, key string, cause error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	k := idempotencyKey{
+		Scope:    IdemScopeProduce,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    "",
+		Key:      key,
+	}
+
 	s.items[k] = IdempotencyStatus{
 		Status:    IdemStatusFailed,
 		LastError: msg,
@@ -139,7 +177,6 @@ func (s *IdempotencyStore) cleanupLocked(now time.Time) {
 	}
 }
 
-// This returns the current status for (tenant, topic, key). ok=false means no record exists; not started/expired
 func (s *IdempotencyStore) Check(tenantID, topic, key string) (st IdempotencyStatus, ok bool) {
 	if key == "" {
 		return IdempotencyStatus{}, false
@@ -150,7 +187,14 @@ func (s *IdempotencyStore) Check(tenantID, topic, key string) (st IdempotencySta
 
 	s.cleanupLocked(time.Now())
 
-	k := idempotencyKey{TenantID: tenantID, Topic: topic, Key: key}
+	k := idempotencyKey{
+		Scope:    IdemScopeProduce,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    "",
+		Key:      key,
+	}
+
 	st, ok = s.items[k]
 	return st, ok
 }
@@ -163,14 +207,15 @@ func (s *IdempotencyStore) MarkFailure(tenantID, topic, key string, cause error)
 	s.Fail(tenantID, topic, key, cause)
 }
 
+// -------------------------
+// Helpers
+// -------------------------
+
 func NewIdempotencyConsumerHelper(store *IdempotencyStore) *IdempotencyConsumerHelper {
 	return &IdempotencyConsumerHelper{store: store}
 }
 
-// Begin checks if (tenant, topic, idempotency_key) is already COMMITTED
-// Returns:
-// - alreadyDone=true => skip side effect, treat as success
-// - alreadyDone=false => proceed with side effect
+// Begin checks PRODUCE-scope committed status (legacy helper; keep it if you want)
 func (h *IdempotencyConsumerHelper) Begin(topic string, msg Message) (alreadyDone bool, priorResult []byte, err error) {
 	if h == nil || h.store == nil {
 		return false, nil, nil
@@ -187,12 +232,10 @@ func (h *IdempotencyConsumerHelper) Begin(topic string, msg Message) (alreadyDon
 		return false, nil, nil
 	}
 
-	// For MVP: only COMMITTED means “already done”
 	if st.Status == IdemStatusCommitted {
 		return true, st.Result, nil
 	}
 
-	// FAILED or PENDING: proceed (consumer retry loop will handle it later)
 	return false, nil, nil
 }
 
@@ -210,4 +253,250 @@ func (h *IdempotencyConsumerHelper) MarkFailure(topic string, msg Message, cause
 	}
 
 	h.store.MarkFailure(msg.Envelope.TenantID, topic, msg.Envelope.IdempotencyKey, cause)
+}
+
+func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner string, lease time.Duration) (alreadyDone bool, priorResult []byte, err error) {
+	if key == "" {
+		return false, nil, nil
+	}
+
+	// Enforce your lease policy (e.g., >= 250ms)
+	if err := validateLease(lease); err != nil {
+		return false, nil, err
+	}
+
+	if owner == "" {
+		owner = "unknown"
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	if st, ok := s.items[k]; ok {
+		switch st.Status {
+		case IdemStatusCommitted:
+			return true, st.Result, nil
+
+		case IdemStatusPending:
+			// Someone else holds a still-valid lease => reject
+			leaseActive := !st.LeaseUntil.IsZero() && now.Before(st.LeaseUntil)
+			if leaseActive && st.Owner != owner {
+				return false, nil, ErrIdempotencyLeaseHeld
+			}
+
+			// Lease expired OR same owner => take/refresh
+			st.Status = IdemStatusPending
+			st.Owner = owner
+			st.LeaseUntil = now.Add(lease)
+			st.UpdatedAt = now
+			s.items[k] = st
+			return false, nil, nil
+
+		case IdemStatusFailed:
+			st.Status = IdemStatusPending
+			st.LastError = ""
+			st.Owner = owner
+			st.LeaseUntil = now.Add(lease)
+			st.UpdatedAt = now
+			s.items[k] = st
+			return false, nil, nil
+
+		default:
+			st.Status = IdemStatusPending
+			st.LastError = ""
+			st.Owner = owner
+			st.LeaseUntil = now.Add(lease)
+			st.UpdatedAt = now
+			s.items[k] = st
+			return false, nil, nil
+		}
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:     IdemStatusPending,
+		UpdatedAt:  now,
+		Owner:      owner,
+		LeaseUntil: now.Add(lease),
+	}
+
+	return false, nil, nil
+}
+
+func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner string, lease time.Duration) error {
+	if key == "" {
+		return nil
+	}
+
+	if err := validateLease(lease); err != nil {
+		return err
+	}
+
+	if owner == "" {
+		owner = "unknown"
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	if st.Status != IdemStatusPending {
+		return ErrIdempotencyLeaseLost
+	}
+
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	st.LeaseUntil = now.Add(lease)
+	st.UpdatedAt = now
+	s.items[k] = st
+
+	return nil
+}
+
+func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, owner string, result []byte) error {
+	if key == "" {
+		return nil
+	}
+
+	if owner == "" {
+		owner = "unknown"
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	if st.Status == IdemStatusCommitted {
+		return nil
+	}
+
+	if st.Status != IdemStatusPending {
+		return ErrIdempotencyLeaseLost
+	}
+
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:     IdemStatusCommitted,
+		Result:     result,
+		LastError:  "",
+		UpdatedAt:  now,
+		Owner:      "",
+		LeaseUntil: time.Time{},
+	}
+
+	return nil
+}
+
+func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner string, cause error) error {
+	if key == "" {
+		return nil
+	}
+
+	if owner == "" {
+		owner = "unknown"
+	}
+
+	msg := ""
+	if cause != nil {
+		msg = cause.Error()
+	}
+
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(now)
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok := s.items[k]
+	if !ok {
+		return ErrIdempotencyNotFound
+	}
+
+	if st.Status != IdemStatusPending {
+		return ErrIdempotencyLeaseLost
+	}
+
+	if st.Owner != owner {
+		return ErrIdempotencyLeaseHeld
+	}
+
+	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
+		return ErrIdempotencyLeaseLost
+	}
+
+	s.items[k] = IdempotencyStatus{
+		Status:     IdemStatusFailed,
+		LastError:  msg,
+		UpdatedAt:  now,
+		Owner:      "",
+		LeaseUntil: time.Time{},
+		Result:     nil,
+	}
+
+	return nil
 }

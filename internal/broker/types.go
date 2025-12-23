@@ -70,7 +70,7 @@ type Broker interface {
 	Consume(ctx context.Context, topic string, group string) (<-chan Message, error)
 
 	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
-	Nack(ctx context.Context, topic, group string, partition int, offset int64, reason string) error
+	Nack(_ context.Context, topic, group string, partition int, offset int64, owner string, reason string) error
 }
 
 type RetryPolicy struct {

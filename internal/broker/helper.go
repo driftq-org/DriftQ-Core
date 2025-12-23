@@ -51,6 +51,7 @@ func (b *InMemoryBroker) slowestAckLocked(topic string, partition int) int64 {
 		if !ok {
 			off = -1
 		}
+
 		if !seen || off < slowest {
 			slowest = off
 			seen = true
