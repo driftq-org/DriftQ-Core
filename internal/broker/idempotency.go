@@ -178,7 +178,23 @@ func (s *IdempotencyStore) cleanupLocked(now time.Time) {
 	}
 
 	cutoff := now.Add(-s.ttl)
+
 	for k, st := range s.items {
+		// This is what makes "don't rerun side effects" actually hold beyond 10 minutes
+		if k.Scope == IdemScopeConsume && st.Status == IdemStatusCommitted {
+			continue
+		}
+
+		// For consume-scope PENDING: do NOT delete if lease is still active
+		// If lease expired and it's old, let TTL evict it
+		if k.Scope == IdemScopeConsume && st.Status == IdemStatusPending {
+			leaseActive := !st.LeaseUntil.IsZero() && now.Before(st.LeaseUntil)
+			if leaseActive {
+				continue
+			}
+		}
+
+		// Default TTL eviction
 		if st.UpdatedAt.Before(cutoff) {
 			delete(s.items, k)
 		}
