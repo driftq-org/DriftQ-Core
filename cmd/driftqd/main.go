@@ -514,9 +514,14 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
+	owner := r.URL.Query().Get("owner")
 	reason := r.URL.Query().Get("reason")
 
-	// CHANGE: require partition (no default)
+	if strings.TrimSpace(owner) == "" {
+		http.Error(w, "owner is required", http.StatusBadRequest)
+		return
+	}
+
 	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
 		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
 		return
@@ -531,12 +536,6 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
 		http.Error(w, "invalid offset", http.StatusBadRequest)
-		return
-	}
-
-	owner := r.URL.Query().Get("owner")
-	if strings.TrimSpace(owner) == "" {
-		http.Error(w, "owner is required", http.StatusBadRequest)
 		return
 	}
 
