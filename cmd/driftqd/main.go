@@ -258,6 +258,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		if idem == "" {
 			idem = strings.TrimSpace(q.Get("idem_key"))
 		}
+
 		if idem != "" {
 			env.IdempotencyKey = idem
 			anySet = true
