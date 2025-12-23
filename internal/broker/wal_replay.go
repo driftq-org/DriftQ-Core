@@ -1,8 +1,12 @@
 package broker
 
-import "github.com/driftq-org/DriftQ-Core/internal/storage"
+import (
+	"time"
 
-// NewInMemoryBrokerFromWAL builds a broker, then replays whatever is in the WAL so I can restore topics, partitions, messages and consumer offsets on startup.
+	"github.com/driftq-org/DriftQ-Core/internal/storage"
+)
+
+// NewInMemoryBrokerFromWAL builds a broker, then replays whatever is in the WAL so I can restore topics, partitions, messages and consumer offsets on startup
 func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 	b := NewInMemoryBrokerWithWAL(wal)
 
@@ -49,7 +53,7 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 				}
 			}
 
-			// Rebuild idempotency committed state from WAL
+			// Rebuild PRODUCE-scope idempotency committed state from WAL (legacy behavior)
 			if b.idem != nil && m.Envelope != nil && m.Envelope.IdempotencyKey != "" {
 				tenantID := m.Envelope.TenantID // FYI: may be ""
 				b.idem.Commit(tenantID, e.Topic, m.Envelope.IdempotencyKey, nil)
@@ -94,12 +98,72 @@ func NewInMemoryBrokerFromWAL(wal storage.WAL) (*InMemoryBroker, error) {
 			// Last-write-wins naturally since WAL is replayed in order
 			rs[e.Offset] = &at
 
+		case storage.RecordTypeConsumeIdempotency:
+			// Durable CONSUME-scope idempotency across restarts
+			// Rule: treat all PENDING leases as expired on restart => ignore PENDING on replay
+			if b.idem == nil {
+				continue
+			}
+
+			if e.IdempotencyScope != IdemScopeConsume {
+				continue
+			}
+
+			if e.Topic == "" || e.Group == "" || e.IdempotencyKey == "" {
+				// group + key required for consume-scope
+				continue
+			}
+
+			updatedAt := time.Now()
+			if e.UpdatedAt != nil {
+				updatedAt = *e.UpdatedAt
+			}
+
+			b.idem.mu.Lock()
+			// NOTE: no cleanup here; we want replay to restore durable state as-is
+			k := idempotencyKey{
+				Scope:    IdemScopeConsume,
+				TenantID: e.TenantID,
+				Topic:    e.Topic,
+				Group:    e.Group,
+				Key:      e.IdempotencyKey,
+			}
+
+			switch e.IdempotencyStatus {
+			case IdemStatusCommitted:
+				b.idem.items[k] = IdempotencyStatus{
+					Status:    IdemStatusCommitted,
+					Result:    e.Result,
+					LastError: "",
+					UpdatedAt: updatedAt,
+					Owner:     "",
+					// lease intentionally cleared on replay
+					LeaseUntil: time.Time{},
+				}
+
+			case IdemStatusFailed:
+				b.idem.items[k] = IdempotencyStatus{
+					Status:     IdemStatusFailed,
+					Result:     nil,
+					LastError:  e.LastError,
+					UpdatedAt:  updatedAt,
+					Owner:      "",
+					LeaseUntil: time.Time{},
+				}
+
+			case IdemStatusPending:
+				// Intentionally ignored: pending leases expire on restart
+			default:
+				// ignore unknown statuses
+			}
+			b.idem.mu.Unlock()
+
 		default:
 			// ignore unknown record types for now
 		}
 	}
 
-	// IMPORTANT: purge retry state for anything already acked, so old errors don’t "resurrect" after restart.
+	// IMPORTANT: purge retry state for anything already acked, so old errors don’t "resurrect" after restart
 	for topic, byGroup := range b.consumerOffsets {
 		for group, byPart := range byGroup {
 			for partition, ackedOffset := range byPart {
