@@ -244,13 +244,22 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			anySet = true
 		}
 
+		// Support tenant_id (primary) + tenant (alias)
 		if v := strings.TrimSpace(q.Get("tenant_id")); v != "" {
+			env.TenantID = v
+			anySet = true
+		} else if v := strings.TrimSpace(q.Get("tenant")); v != "" {
 			env.TenantID = v
 			anySet = true
 		}
 
-		if v := strings.TrimSpace(q.Get("idempotency_key")); v != "" {
-			env.IdempotencyKey = v
+		// Support idempotency_key (primary) + idem_key (alias)
+		idem := strings.TrimSpace(q.Get("idempotency_key"))
+		if idem == "" {
+			idem = strings.TrimSpace(q.Get("idem_key"))
+		}
+		if idem != "" {
+			env.IdempotencyKey = idem
 			anySet = true
 		}
 
