@@ -14,17 +14,19 @@ import (
 type RecordType uint8
 
 const (
-	RecordTypeMessage    RecordType = 1
-	RecordTypeOffset     RecordType = 2
-	RecordTypeTopic      RecordType = 3 // topic/partition metadata (optional for later)
-	RecordTypeRetryState RecordType = 4 // (topic, group, partition, offset) -> last_error (+ timestamp)
+	RecordTypeMessage            RecordType = 1
+	RecordTypeOffset             RecordType = 2
+	RecordTypeTopic              RecordType = 3 // topic/partition metadata (optional for later)
+	RecordTypeRetryState         RecordType = 4 // (topic, group, partition, offset) -> last_error (+ timestamp)
+	RecordTypeConsumeIdempotency RecordType = 5 // (scope=consume, tenant, topic, group, idempotency_key) state transitions
 )
 
 type Entry struct {
-	Type      RecordType `json:"type"`
-	Topic     string     `json:"topic"`
-	Partition int        `json:"partition"`
-	Offset    int64      `json:"offset"`
+	Type RecordType `json:"type"`
+
+	Topic     string `json:"topic,omitempty"`
+	Partition int    `json:"partition,omitempty"`
+	Offset    int64  `json:"offset,omitempty"`
 
 	Group string `json:"group,omitempty"`
 
@@ -64,6 +66,16 @@ type Entry struct {
 	// Retry state records (RecordTypeRetryState)
 	LastError   string     `json:"last_error,omitempty"`
 	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
+
+	// Consume idempotency records (RecordTypeConsumeIdempotency)
+	IdempotencyScope  string `json:"idempotency_scope,omitempty"`  // "consume"
+	IdempotencyStatus string `json:"idempotency_status,omitempty"` // "PENDING"|"COMMITTED"|"FAILED"
+
+	LeaseOwner string     `json:"lease_owner,omitempty"`
+	LeaseUntil *time.Time `json:"lease_until,omitempty"`
+
+	Result    []byte     `json:"result,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 type WAL interface {

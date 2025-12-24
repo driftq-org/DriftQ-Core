@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
 const (
@@ -58,9 +60,14 @@ type IdempotencyStore struct {
 	mu    sync.Mutex
 	ttl   time.Duration
 	items map[idempotencyKey]IdempotencyStatus
+	wal   storage.WAL
 }
 
 func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
+	return NewIdempotencyStoreWithWAL(nil, ttl)
+}
+
+func NewIdempotencyStoreWithWAL(wal storage.WAL, ttl time.Duration) *IdempotencyStore {
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
@@ -68,6 +75,7 @@ func NewIdempotencyStore(ttl time.Duration) *IdempotencyStore {
 	return &IdempotencyStore{
 		ttl:   ttl,
 		items: make(map[idempotencyKey]IdempotencyStatus),
+		wal:   wal,
 	}
 }
 
@@ -170,7 +178,23 @@ func (s *IdempotencyStore) cleanupLocked(now time.Time) {
 	}
 
 	cutoff := now.Add(-s.ttl)
+
 	for k, st := range s.items {
+		// This is what makes "don't rerun side effects" actually hold beyond 10 minutes
+		if k.Scope == IdemScopeConsume && st.Status == IdemStatusCommitted {
+			continue
+		}
+
+		// For consume-scope PENDING: do NOT delete if lease is still active
+		// If lease expired and it's old, let TTL evict it
+		if k.Scope == IdemScopeConsume && st.Status == IdemStatusPending {
+			leaseActive := !st.LeaseUntil.IsZero() && now.Before(st.LeaseUntil)
+			if leaseActive {
+				continue
+			}
+		}
+
+		// Default TTL eviction
 		if st.UpdatedAt.Before(cutoff) {
 			delete(s.items, k)
 		}
@@ -284,6 +308,29 @@ func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner 
 		Key:      key,
 	}
 
+	// Helper to durably record "PENDING + lease" before mutating memory.
+	appendPending := func(leaseUntil time.Time) error {
+		if s.wal == nil {
+			return nil
+		}
+		updatedAt := now
+		lu := leaseUntil
+		return s.wal.Append(storage.Entry{
+			Type:              storage.RecordTypeConsumeIdempotency,
+			TenantID:          tenantID,
+			Topic:             topic,
+			Group:             group,
+			IdempotencyKey:    key,
+			IdempotencyScope:  IdemScopeConsume,
+			IdempotencyStatus: IdemStatusPending,
+			LeaseOwner:        owner,
+			LeaseUntil:        &lu,
+			Result:            nil,
+			LastError:         "",
+			UpdatedAt:         &updatedAt,
+		})
+	}
+
 	if st, ok := s.items[k]; ok {
 		switch st.Status {
 		case IdemStatusCommitted:
@@ -297,38 +344,59 @@ func (s *IdempotencyStore) ConsumeBeginLease(tenantID, topic, group, key, owner 
 			}
 
 			// Lease expired OR same owner => take/refresh
+			newUntil := now.Add(lease)
+			if err := appendPending(newUntil); err != nil {
+				return false, nil, err
+			}
+
 			st.Status = IdemStatusPending
 			st.Owner = owner
-			st.LeaseUntil = now.Add(lease)
+			st.LeaseUntil = newUntil
 			st.UpdatedAt = now
 			s.items[k] = st
 			return false, nil, nil
 
 		case IdemStatusFailed:
+			newUntil := now.Add(lease)
+			if err := appendPending(newUntil); err != nil {
+				return false, nil, err
+			}
+
 			st.Status = IdemStatusPending
 			st.LastError = ""
 			st.Owner = owner
-			st.LeaseUntil = now.Add(lease)
+			st.LeaseUntil = newUntil
 			st.UpdatedAt = now
 			s.items[k] = st
 			return false, nil, nil
 
 		default:
+			newUntil := now.Add(lease)
+			if err := appendPending(newUntil); err != nil {
+				return false, nil, err
+			}
+
 			st.Status = IdemStatusPending
 			st.LastError = ""
 			st.Owner = owner
-			st.LeaseUntil = now.Add(lease)
+			st.LeaseUntil = newUntil
 			st.UpdatedAt = now
 			s.items[k] = st
 			return false, nil, nil
 		}
 	}
 
+	// New entry
+	newUntil := now.Add(lease)
+	if err := appendPending(newUntil); err != nil {
+		return false, nil, err
+	}
+
 	s.items[k] = IdempotencyStatus{
 		Status:     IdemStatusPending,
 		UpdatedAt:  now,
 		Owner:      owner,
-		LeaseUntil: now.Add(lease),
+		LeaseUntil: newUntil,
 	}
 
 	return false, nil, nil
@@ -379,7 +447,31 @@ func (s *IdempotencyStore) ConsumeRenewLease(tenantID, topic, group, key, owner 
 		return ErrIdempotencyLeaseLost
 	}
 
-	st.LeaseUntil = now.Add(lease)
+	newUntil := now.Add(lease)
+
+	// Durable renew before mutating memory
+	if s.wal != nil {
+		updatedAt := now
+		lu := newUntil
+		if err := s.wal.Append(storage.Entry{
+			Type:              storage.RecordTypeConsumeIdempotency,
+			TenantID:          tenantID,
+			Topic:             topic,
+			Group:             group,
+			IdempotencyKey:    key,
+			IdempotencyScope:  IdemScopeConsume,
+			IdempotencyStatus: IdemStatusPending, // still pending, just updated lease
+			LeaseOwner:        owner,
+			LeaseUntil:        &lu,
+			Result:            nil,
+			LastError:         "",
+			UpdatedAt:         &updatedAt,
+		}); err != nil {
+			return err
+		}
+	}
+
+	st.LeaseUntil = newUntil
 	st.UpdatedAt = now
 	s.items[k] = st
 
@@ -429,6 +521,32 @@ func (s *IdempotencyStore) ConsumeCommitIfOwner(tenantID, topic, group, key, own
 
 	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
+	}
+
+	if s.wal != nil {
+		updatedAt := now
+		lu := st.LeaseUntil
+
+		entry := storage.Entry{
+			Type:              storage.RecordTypeConsumeIdempotency,
+			TenantID:          tenantID,
+			Topic:             topic,
+			Group:             group,
+			IdempotencyKey:    key,
+			IdempotencyScope:  IdemScopeConsume,
+			IdempotencyStatus: IdemStatusCommitted,
+
+			LeaseOwner: owner,
+			LeaseUntil: &lu,
+
+			Result:    result,
+			LastError: "",
+			UpdatedAt: &updatedAt,
+		}
+
+		if err := s.wal.Append(entry); err != nil {
+			return err
+		}
 	}
 
 	s.items[k] = IdempotencyStatus{
@@ -487,6 +605,27 @@ func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner
 
 	if st.LeaseUntil.IsZero() || !now.Before(st.LeaseUntil) {
 		return ErrIdempotencyLeaseLost
+	}
+
+	// Durable failure before mutating memory
+	if s.wal != nil {
+		updatedAt := now
+		if err := s.wal.Append(storage.Entry{
+			Type:              storage.RecordTypeConsumeIdempotency,
+			TenantID:          tenantID,
+			Topic:             topic,
+			Group:             group,
+			IdempotencyKey:    key,
+			IdempotencyScope:  IdemScopeConsume,
+			IdempotencyStatus: IdemStatusFailed,
+			LeaseOwner:        owner,
+			LeaseUntil:        nil, // failure clears lease
+			Result:            nil,
+			LastError:         msg,
+			UpdatedAt:         &updatedAt,
+		}); err != nil {
+			return err
+		}
 	}
 
 	s.items[k] = IdempotencyStatus{
