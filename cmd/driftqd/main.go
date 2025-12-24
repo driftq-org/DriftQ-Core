@@ -100,7 +100,7 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 		switch r.Method {
 		case http.MethodGet:
 			if get == nil {
-				w.Header().Set("Allow", "POST")
+				w.Header().Set("Allow", http.MethodPost)
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
@@ -108,7 +108,7 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 
 		case http.MethodPost:
 			if post == nil {
-				w.Header().Set("Allow", "GET")
+				w.Header().Set("Allow", http.MethodGet)
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
@@ -117,11 +117,11 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 		default:
 			allow := []string{}
 			if get != nil {
-				allow = append(allow, "GET")
+				allow = append(allow, http.MethodGet)
 			}
 
 			if post != nil {
-				allow = append(allow, "POST")
+				allow = append(allow, http.MethodPost)
 			}
 
 			if len(allow) > 0 {
@@ -133,8 +133,16 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("ok\n"))
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+	})
 }
 
 func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
