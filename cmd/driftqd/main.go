@@ -62,6 +62,14 @@ func main() {
 	v1Mux.HandleFunc("/nack", s.handleNack)
 
 	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
+	rootMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   "NOT_FOUND",
+			"message": "use /v1/* endpoints",
+		})
+	})
 
 	srv := &http.Server{
 		Addr:         *addr,
