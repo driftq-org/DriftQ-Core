@@ -57,7 +57,8 @@ func main() {
 	v1Mux.HandleFunc("/produce", s.handleProduce)
 	v1Mux.HandleFunc("/consume", s.handleConsume)
 	v1Mux.HandleFunc("/ack", s.handleAck)
-	v1Mux.HandleFunc("/topics", s.handleTopics)
+	// v1Mux.HandleFunc("/topics", s.handleTopics)
+	v1Mux.HandleFunc("/topics", method(s.handleTopicsList, s.handleTopicsCreate))
 	v1Mux.HandleFunc("/nack", s.handleNack)
 
 	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
@@ -93,6 +94,43 @@ func main() {
 	}
 
 	fmt.Println("DriftQ broker stopped")
+}
+
+func method(get, post http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if get == nil {
+				w.Header().Set("Allow", "POST")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			get(w, r)
+
+		case http.MethodPost:
+			if post == nil {
+				w.Header().Set("Allow", "GET")
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			post(w, r)
+
+		default:
+			allow := []string{}
+			if get != nil {
+				allow = append(allow, "GET")
+			}
+
+			if post != nil {
+				allow = append(allow, "POST")
+			}
+
+			if len(allow) > 0 {
+				w.Header().Set("Allow", strings.Join(allow, ", "))
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
