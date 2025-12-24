@@ -50,24 +50,21 @@ func main() {
 	b.SetRouter(TestRouter{})
 	s := &server{broker: b}
 
-	mux := http.NewServeMux()
+	rootMux := http.NewServeMux()
+	v1Mux := http.NewServeMux()
 
-	// Health check
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/produce", s.handleProduce)
-	mux.HandleFunc("/consume", s.handleConsume)
-	mux.HandleFunc("/ack", s.handleAck)
+	v1Mux.HandleFunc("/healthz", s.handleHealthz)
+	v1Mux.HandleFunc("/produce", s.handleProduce)
+	v1Mux.HandleFunc("/consume", s.handleConsume)
+	v1Mux.HandleFunc("/ack", s.handleAck)
+	v1Mux.HandleFunc("/topics", s.handleTopics)
+	v1Mux.HandleFunc("/nack", s.handleNack)
 
-	// Dev-only topic admin endpoints
-	mux.HandleFunc("/topics", s.handleTopics)
-	mux.HandleFunc("/nack", s.handleNack)
+	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
 
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      mux,
+		Handler:      rootMux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0, // or 10 * time.Second
 	}
@@ -96,6 +93,11 @@ func main() {
 	}
 
 	fmt.Println("DriftQ broker stopped")
+}
+
+func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // handleTopics handles:
