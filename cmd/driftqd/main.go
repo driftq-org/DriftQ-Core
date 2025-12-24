@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,30 +47,34 @@ func main() {
 	defer appCancel()
 
 	b.StartRedeliveryLoop(appCtx)
-
 	b.SetRouter(TestRouter{})
+
 	s := &server{broker: b}
 
-	mux := http.NewServeMux()
+	rootMux := http.NewServeMux()
+	v1Mux := http.NewServeMux()
 
-	// Health check
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("ok\n"))
+	// v1 routes
+	v1Mux.HandleFunc("/healthz", s.requireMethod(http.MethodGet)(s.handleHealthz))
+	v1Mux.HandleFunc("/produce", s.requireMethod(http.MethodPost)(s.handleProduce))
+	v1Mux.HandleFunc("/consume", s.requireMethod(http.MethodGet)(s.handleConsume))
+	v1Mux.HandleFunc("/ack", s.requireMethod(http.MethodPost)(s.handleAck))
+	v1Mux.HandleFunc("/nack", s.requireMethod(http.MethodPost)(s.handleNack))
+	v1Mux.HandleFunc("/topics", s.method(s.handleTopicsList, s.handleTopicsCreate))
+
+	// mount v1 under /v1/*
+	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
+
+	// block unversioned routes
+	rootMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s.writeJSONError(w, http.StatusNotFound, "NOT_FOUND", "use /v1/* endpoints", nil)
 	})
-	mux.HandleFunc("/produce", s.handleProduce)
-	mux.HandleFunc("/consume", s.handleConsume)
-	mux.HandleFunc("/ack", s.handleAck)
-
-	// Dev-only topic admin endpoints
-	mux.HandleFunc("/topics", s.handleTopics)
-	mux.HandleFunc("/nack", s.handleNack)
 
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      mux,
+		Handler:      rootMux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 0, // or 10 * time.Second
+		WriteTimeout: 0,
 	}
 
 	log.Printf("DriftQ broker starting on %s\n", *addr)
@@ -98,59 +103,131 @@ func main() {
 	fmt.Println("DriftQ broker stopped")
 }
 
-// handleTopics handles:
-//
-//	GET  /topics                           -> list topics
-//	POST /topics?name=foo&partitions=3     -> create topic
-//
-// This is a dev-only HTTP surface; proper gRPC/HTTP APIs will replace it later
-func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
 
-	switch r.Method {
-	case http.MethodGet:
-		topics, err := s.broker.ListTopics(ctx)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+func (s *server) writeJSONError(w http.ResponseWriter, status int, code, msg string, extra map[string]any) {
+	obj := map[string]any{
+		"error":   code,
+		"message": msg,
+	}
+	if extra != nil {
+		maps.Copy(obj, extra)
+	}
+	writeJSON(w, status, obj)
+}
+
+// requireMethod wraps a handler and rejects non-allowed methods with JSON 405 + Allow
+func (s *server) requireMethod(allowed ...string) func(http.HandlerFunc) http.HandlerFunc {
+	allowSet := map[string]struct{}{}
+	for _, m := range allowed {
+		allowSet[m] = struct{}{}
+	}
+	allowHeader := strings.Join(allowed, ", ")
+
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := allowSet[r.Method]; !ok {
+				if allowHeader != "" {
+					w.Header().Set("Allow", allowHeader)
+				}
+				s.writeJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+				return
+			}
+			next(w, r)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"topics": topics,
-		})
-
-	case http.MethodPost:
-		name := r.URL.Query().Get("name")
-		partitionsStr := r.URL.Query().Get("partitions")
-		if partitionsStr == "" {
-			partitionsStr = "1"
-		}
-
-		partitions, err := strconv.Atoi(partitionsStr)
-		if err != nil || partitions <= 0 {
-			http.Error(w, "invalid partitions", http.StatusBadRequest)
-			return
-		}
-
-		if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte("created\n"))
-
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+// method dispatches GET/POST with proper Allow header and JSON 405
+func (s *server) method(get, post http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if get == nil {
+				w.Header().Set("Allow", http.MethodPost)
+				s.writeJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+				return
+			}
+			get(w, r)
+		case http.MethodPost:
+			if post == nil {
+				w.Header().Set("Allow", http.MethodGet)
+				s.writeJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+				return
+			}
+			post(w, r)
+
+		default:
+			allow := make([]string, 0, 2)
+			if get != nil {
+				allow = append(allow, http.MethodGet)
+			}
+
+			if post != nil {
+				allow = append(allow, http.MethodPost)
+			}
+
+			if len(allow) > 0 {
+				w.Header().Set("Allow", strings.Join(allow, ", "))
+			}
+			s.writeJSONError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+		}
+	}
+}
+
+func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	topics, err := s.broker.ListTopics(ctx)
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
 		return
 	}
 
+	writeJSON(w, http.StatusOK, map[string]any{"topics": topics})
+}
+
+func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "name is required", nil)
+		return
+	}
+
+	partitionsStr := strings.TrimSpace(r.URL.Query().Get("partitions"))
+	if partitionsStr == "" {
+		partitionsStr = "1"
+	}
+
+	partitions, err := strconv.Atoi(partitionsStr)
+	if err != nil || partitions <= 0 {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partitions", nil)
+		return
+	}
+
+	if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":     "created",
+		"name":       name,
+		"partitions": partitions,
+	})
+}
+
+func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	type produceRequest struct {
@@ -161,13 +238,12 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	parseDeadline := func(q url.Values) (*time.Time, error) {
-		// accept either deadline_rfc3339 or deadline_ms
 		if v := strings.TrimSpace(q.Get("deadline_rfc3339")); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
-
 			if err != nil {
 				return nil, fmt.Errorf("invalid deadline_rfc3339: %w", err)
 			}
+
 			return &t, nil
 		}
 
@@ -176,9 +252,11 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid deadline_ms: %w", err)
 			}
+
 			t := time.Unix(0, ms*int64(time.Millisecond))
 			return &t, nil
 		}
+
 		return nil, nil
 	}
 
@@ -215,7 +293,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil {
-			http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
+			s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error(), nil)
 			return
 		}
 	} else {
@@ -225,7 +303,6 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		req.Key = q.Get("key")
 		req.Value = q.Get("value")
 
-		// Query-param envelope support (labels skipped for now)
 		env := &broker.Envelope{}
 		anySet := false
 
@@ -244,7 +321,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			anySet = true
 		}
 
-		// Support tenant_id (primary) + tenant (alias)
+		// tenant_id (primary) + tenant (alias)
 		if v := strings.TrimSpace(q.Get("tenant_id")); v != "" {
 			env.TenantID = v
 			anySet = true
@@ -253,7 +330,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			anySet = true
 		}
 
-		// Support idempotency_key (primary) + idem_key (alias)
+		// idempotency_key (primary) + idem_key (alias)
 		idem := strings.TrimSpace(q.Get("idempotency_key"))
 		if idem == "" {
 			idem = strings.TrimSpace(q.Get("idem_key"))
@@ -271,18 +348,16 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 		if v := strings.TrimSpace(q.Get("partition_override")); v != "" {
 			pi, err := strconv.Atoi(v)
-
 			if err != nil || pi < 0 {
-				http.Error(w, "invalid partition_override", http.StatusBadRequest)
+				s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition_override", nil)
 				return
 			}
-
 			env.PartitionOverride = &pi
 			anySet = true
 		}
 
 		if dl, err := parseDeadline(q); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		} else if dl != nil {
 			env.Deadline = dl
@@ -292,29 +367,27 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		// Retry policy (query params)
 		maxAttemptsPtr, err := parseOptInt(q, "retry_max_attempts")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
 
 		backoffPtr, err := parseOptInt64(q, "retry_backoff_ms")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
-
 		maxBackoffPtr, err := parseOptInt64(q, "retry_max_backoff_ms")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
 
-		// Validate + build RetryPolicy only if something was provided
 		if maxAttemptsPtr != nil || backoffPtr != nil || maxBackoffPtr != nil {
 			rp := &broker.RetryPolicy{}
 
 			if maxAttemptsPtr != nil {
 				if *maxAttemptsPtr < 0 {
-					http.Error(w, "invalid retry_max_attempts", http.StatusBadRequest)
+					s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_max_attempts", nil)
 					return
 				}
 				rp.MaxAttempts = *maxAttemptsPtr
@@ -322,7 +395,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			if backoffPtr != nil {
 				if *backoffPtr < 0 {
-					http.Error(w, "invalid retry_backoff_ms", http.StatusBadRequest)
+					s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_backoff_ms", nil)
 					return
 				}
 				rp.BackoffMs = *backoffPtr
@@ -330,19 +403,17 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			if maxBackoffPtr != nil {
 				if *maxBackoffPtr < 0 {
-					http.Error(w, "invalid retry_max_backoff_ms", http.StatusBadRequest)
+					s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_max_backoff_ms", nil)
 					return
 				}
 				rp.MaxBackoffMs = *maxBackoffPtr
 			}
 
-			// If any backoff knobs are set, require maxAttempts > 0
 			if (backoffPtr != nil || maxBackoffPtr != nil) && rp.MaxAttempts <= 0 {
-				http.Error(w, "retry_max_attempts must be > 0 when using retry backoff params", http.StatusBadRequest)
+				s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "retry_max_attempts must be > 0 when using retry backoff params", nil)
 				return
 			}
 
-			// If it's effectively empty, keep nil
 			if rp.MaxAttempts != 0 || rp.BackoffMs != 0 || rp.MaxBackoffMs != 0 {
 				env.RetryPolicy = rp
 				anySet = true
@@ -354,8 +425,8 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.Topic == "" || req.Value == "" {
-		http.Error(w, "topic and value are required", http.StatusBadRequest)
+	if strings.TrimSpace(req.Topic) == "" || req.Value == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic and value are required", nil)
 		return
 	}
 
@@ -381,55 +452,47 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			}
 
 			secs := int((retryAfter + time.Second - 1) / time.Second)
-
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusTooManyRequests)
 
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error":          "RESOURCE_EXHAUSTED",
+			s.writeJSONError(w, http.StatusTooManyRequests, "RESOURCE_EXHAUSTED", err.Error(), map[string]any{
 				"reason":         reason,
-				"message":        err.Error(),
 				"retry_after_ms": int(retryAfter / time.Millisecond),
 			})
 			return
 		}
 
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("produced\n"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "produced",
+		"topic":  req.Topic,
+	})
 }
 
 func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	ctx := r.Context()
 
 	topic := r.URL.Query().Get("topic")
 	group := r.URL.Query().Get("group")
-	if topic == "" || group == "" {
-		http.Error(w, "topic and group are required", http.StatusBadRequest)
+	if strings.TrimSpace(topic) == "" || strings.TrimSpace(group) == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic and group are required", nil)
 		return
 	}
 
 	ch, err := s.broker.Consume(ctx, topic, group)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 		return
 	}
 
-	// We are going to stream NDJSON (one JSON object per line)
+	// stream NDJSON
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		s.writeJSONError(w, http.StatusInternalServerError, "INTERNAL", "streaming not supported", nil)
 		return
 	}
 
@@ -467,18 +530,12 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			if err := enc.Encode(obj); err != nil {
 				return
 			}
-
 			flusher.Flush()
 		}
 	}
 }
 
 func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	ctx := r.Context()
 
 	topic := r.URL.Query().Get("topic")
@@ -486,75 +543,83 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
 
-	// CHANGE: require partition (no default)
 	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
-		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, partition, and offset are required", nil)
 		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
-		http.Error(w, "invalid partition", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition", nil)
 		return
 	}
 
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
-		http.Error(w, "invalid offset", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset", nil)
 		return
 	}
 
 	if err := s.broker.Ack(ctx, topic, group, partition, offset); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "FAILED_PRECONDITION", err.Error(), nil)
 		return
 	}
 
-	_, _ = w.Write([]byte("acked\n"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "acked",
+		"topic":     topic,
+		"group":     group,
+		"partition": partition,
+		"offset":    offset,
+	})
 }
 
 func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	ctx := r.Context()
 
 	topic := r.URL.Query().Get("topic")
 	group := r.URL.Query().Get("group")
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
-	owner := r.URL.Query().Get("owner")
+	owner := strings.TrimSpace(r.URL.Query().Get("owner"))
 	reason := r.URL.Query().Get("reason")
 
-	if strings.TrimSpace(owner) == "" {
-		http.Error(w, "owner is required", http.StatusBadRequest)
+	if owner == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "owner is required", nil)
 		return
 	}
 
 	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
-		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, partition, and offset are required", nil)
 		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
-		http.Error(w, "invalid partition", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition", nil)
 		return
 	}
 
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
-		http.Error(w, "invalid offset", http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset", nil)
 		return
 	}
 
 	if err := s.broker.Nack(ctx, topic, group, partition, offset, owner, reason); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.writeJSONError(w, http.StatusBadRequest, "FAILED_PRECONDITION", err.Error(), nil)
 		return
 	}
 
-	_, _ = w.Write([]byte("nacked\n"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "nacked",
+		"topic":     topic,
+		"group":     group,
+		"partition": partition,
+		"offset":    offset,
+		"owner":     owner,
+		"reason":    reason,
+	})
 }
 
 func (TestRouter) Route(_ context.Context, topic string, msg broker.Message) (broker.RoutingDecision, error) {
