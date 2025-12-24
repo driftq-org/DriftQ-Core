@@ -97,20 +97,29 @@ func main() {
 }
 
 func method(get, post http.HandlerFunc) http.HandlerFunc {
+	write := func(w http.ResponseWriter, status int, allow string) {
+		if allow != "" {
+			w.Header().Set("Allow", allow)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   "METHOD_NOT_ALLOWED",
+			"message": "method not allowed",
+		})
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			if get == nil {
-				w.Header().Set("Allow", http.MethodPost)
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				write(w, http.StatusMethodNotAllowed, http.MethodPost)
 				return
 			}
 			get(w, r)
-
 		case http.MethodPost:
 			if post == nil {
-				w.Header().Set("Allow", http.MethodGet)
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				write(w, http.StatusMethodNotAllowed, http.MethodGet)
 				return
 			}
 			post(w, r)
@@ -124,11 +133,7 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 			if post != nil {
 				allow = append(allow, http.MethodPost)
 			}
-
-			if len(allow) > 0 {
-				w.Header().Set("Allow", strings.Join(allow, ", "))
-			}
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			write(w, http.StatusMethodNotAllowed, strings.Join(allow, ", "))
 		}
 	}
 }
@@ -136,14 +141,17 @@ func method(get, post http.HandlerFunc) http.HandlerFunc {
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   "METHOD_NOT_ALLOWED",
+			"message": "method not allowed",
+		})
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status": "ok",
-	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 }
 
 func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
