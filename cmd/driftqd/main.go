@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -205,9 +206,10 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			"message": msg,
 		}
 
-		for k, v := range extra {
-			obj[k] = v
+		if extra != nil {
+			maps.Copy(obj, extra)
 		}
+
 		_ = json.NewEncoder(w).Encode(obj)
 	}
 
