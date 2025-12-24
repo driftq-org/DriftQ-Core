@@ -195,8 +195,25 @@ func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
+	// Helper: consistent JSON errors
+	writeJSONError := func(status int, code, msg string, extra map[string]any) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+
+		obj := map[string]any{
+			"error":   code,
+			"message": msg,
+		}
+
+		for k, v := range extra {
+			obj[k] = v
+		}
+		_ = json.NewEncoder(w).Encode(obj)
+	}
+
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
 	}
 
@@ -213,10 +230,10 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		// accept either deadline_rfc3339 or deadline_ms
 		if v := strings.TrimSpace(q.Get("deadline_rfc3339")); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
-
 			if err != nil {
 				return nil, fmt.Errorf("invalid deadline_rfc3339: %w", err)
 			}
+
 			return &t, nil
 		}
 
@@ -225,9 +242,11 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid deadline_ms: %w", err)
 			}
+
 			t := time.Unix(0, ms*int64(time.Millisecond))
 			return &t, nil
 		}
+
 		return nil, nil
 	}
 
@@ -264,7 +283,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil {
-			http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
+			writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error(), nil)
 			return
 		}
 	} else {
@@ -320,9 +339,8 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 		if v := strings.TrimSpace(q.Get("partition_override")); v != "" {
 			pi, err := strconv.Atoi(v)
-
 			if err != nil || pi < 0 {
-				http.Error(w, "invalid partition_override", http.StatusBadRequest)
+				writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition_override", nil)
 				return
 			}
 
@@ -331,7 +349,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if dl, err := parseDeadline(q); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		} else if dl != nil {
 			env.Deadline = dl
@@ -341,19 +359,19 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		// Retry policy (query params)
 		maxAttemptsPtr, err := parseOptInt(q, "retry_max_attempts")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
 
 		backoffPtr, err := parseOptInt64(q, "retry_backoff_ms")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
 
 		maxBackoffPtr, err := parseOptInt64(q, "retry_max_backoff_ms")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 			return
 		}
 
@@ -363,7 +381,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			if maxAttemptsPtr != nil {
 				if *maxAttemptsPtr < 0 {
-					http.Error(w, "invalid retry_max_attempts", http.StatusBadRequest)
+					writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_max_attempts", nil)
 					return
 				}
 				rp.MaxAttempts = *maxAttemptsPtr
@@ -371,7 +389,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			if backoffPtr != nil {
 				if *backoffPtr < 0 {
-					http.Error(w, "invalid retry_backoff_ms", http.StatusBadRequest)
+					writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_backoff_ms", nil)
 					return
 				}
 				rp.BackoffMs = *backoffPtr
@@ -379,7 +397,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			if maxBackoffPtr != nil {
 				if *maxBackoffPtr < 0 {
-					http.Error(w, "invalid retry_max_backoff_ms", http.StatusBadRequest)
+					writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid retry_max_backoff_ms", nil)
 					return
 				}
 				rp.MaxBackoffMs = *maxBackoffPtr
@@ -387,7 +405,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			// If any backoff knobs are set, require maxAttempts > 0
 			if (backoffPtr != nil || maxBackoffPtr != nil) && rp.MaxAttempts <= 0 {
-				http.Error(w, "retry_max_attempts must be > 0 when using retry backoff params", http.StatusBadRequest)
+				writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "retry_max_attempts must be > 0 when using retry backoff params", nil)
 				return
 			}
 
@@ -403,8 +421,8 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.Topic == "" || req.Value == "" {
-		http.Error(w, "topic and value are required", http.StatusBadRequest)
+	if strings.TrimSpace(req.Topic) == "" || req.Value == "" {
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "topic and value are required", nil)
 		return
 	}
 
@@ -430,26 +448,24 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 			}
 
 			secs := int((retryAfter + time.Second - 1) / time.Second)
-
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusTooManyRequests)
 
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error":          "RESOURCE_EXHAUSTED",
+			writeJSONError(http.StatusTooManyRequests, "RESOURCE_EXHAUSTED", err.Error(), map[string]any{
 				"reason":         reason,
-				"message":        err.Error(),
 				"retry_after_ms": int(retryAfter / time.Millisecond),
 			})
 			return
 		}
 
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error(), nil)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("produced\n"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "produced",
+		"topic":  req.Topic,
+	})
 }
 
 func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
