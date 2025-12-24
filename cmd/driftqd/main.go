@@ -57,7 +57,6 @@ func main() {
 	v1Mux.HandleFunc("/produce", s.handleProduce)
 	v1Mux.HandleFunc("/consume", s.handleConsume)
 	v1Mux.HandleFunc("/ack", s.handleAck)
-	// v1Mux.HandleFunc("/topics", s.handleTopics)
 	v1Mux.HandleFunc("/topics", method(s.handleTopicsList, s.handleTopicsCreate))
 	v1Mux.HandleFunc("/nack", s.handleNack)
 
@@ -183,6 +182,55 @@ func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	topics, err := s.broker.ListTopics(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"topics": topics,
+	})
+}
+
+func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	partitionsStr := strings.TrimSpace(r.URL.Query().Get("partitions"))
+	if partitionsStr == "" {
+		partitionsStr = "1"
+	}
+
+	partitions, err := strconv.Atoi(partitionsStr)
+	if err != nil || partitions <= 0 {
+		http.Error(w, "invalid partitions", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":     "created",
+		"name":       name,
+		"partitions": partitions,
+	})
 }
 
 func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
