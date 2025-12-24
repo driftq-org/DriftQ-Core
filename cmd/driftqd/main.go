@@ -137,53 +137,6 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// handleTopics handles:
-//
-//	GET  /topics                           -> list topics
-//	POST /topics?name=foo&partitions=3     -> create topic
-//
-// This is a dev-only HTTP surface; proper gRPC/HTTP APIs will replace it later
-func (s *server) handleTopics(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	switch r.Method {
-	case http.MethodGet:
-		topics, err := s.broker.ListTopics(ctx)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"topics": topics,
-		})
-
-	case http.MethodPost:
-		name := r.URL.Query().Get("name")
-		partitionsStr := r.URL.Query().Get("partitions")
-		if partitionsStr == "" {
-			partitionsStr = "1"
-		}
-
-		partitions, err := strconv.Atoi(partitionsStr)
-		if err != nil || partitions <= 0 {
-			http.Error(w, "invalid partitions", http.StatusBadRequest)
-			return
-		}
-
-		if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte("created\n"))
-
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
