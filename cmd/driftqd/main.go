@@ -479,8 +479,18 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
+	writeJSONError := func(status int, code, msg string) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   code,
+			"message": msg,
+		})
+	}
+
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSONError(http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		return
 	}
 
@@ -488,23 +498,23 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 
 	topic := r.URL.Query().Get("topic")
 	group := r.URL.Query().Get("group")
-	if topic == "" || group == "" {
-		http.Error(w, "topic and group are required", http.StatusBadRequest)
+	if strings.TrimSpace(topic) == "" || strings.TrimSpace(group) == "" {
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "topic and group are required")
 		return
 	}
 
 	ch, err := s.broker.Consume(ctx, topic, group)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
 
-	// We are going to stream NDJSON (one JSON object per line)
+	// stream NDJSON
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		writeJSONError(http.StatusInternalServerError, "INTERNAL", "streaming not supported")
 		return
 	}
 
