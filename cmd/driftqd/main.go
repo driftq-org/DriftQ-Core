@@ -549,8 +549,18 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
+	writeJSONError := func(status int, code, msg string) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   code,
+			"message": msg,
+		})
+	}
+
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		return
 	}
 
@@ -561,35 +571,51 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
 
-	// CHANGE: require partition (no default)
 	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
-		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, partition, and offset are required")
 		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
-		http.Error(w, "invalid partition", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition")
 		return
 	}
 
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
-		http.Error(w, "invalid offset", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset")
 		return
 	}
 
 	if err := s.broker.Ack(ctx, topic, group, partition, offset); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "FAILED_PRECONDITION", err.Error())
 		return
 	}
 
-	_, _ = w.Write([]byte("acked\n"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "acked",
+		"topic":     topic,
+		"group":     group,
+		"partition": partition,
+		"offset":    offset,
+	})
 }
 
 func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
+	writeJSONError := func(status int, code, msg string) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":   code,
+			"message": msg,
+		})
+	}
+
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		return
 	}
 
@@ -599,37 +625,46 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
 	offsetStr := r.URL.Query().Get("offset")
 	partitionStr := r.URL.Query().Get("partition")
-	owner := r.URL.Query().Get("owner")
+	owner := strings.TrimSpace(r.URL.Query().Get("owner"))
 	reason := r.URL.Query().Get("reason")
 
-	if strings.TrimSpace(owner) == "" {
-		http.Error(w, "owner is required", http.StatusBadRequest)
+	if owner == "" {
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "owner is required")
 		return
 	}
 
 	if topic == "" || group == "" || offsetStr == "" || partitionStr == "" {
-		http.Error(w, "topic, group, partition, and offset are required", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, partition, and offset are required")
 		return
 	}
 
 	partition, err := strconv.Atoi(partitionStr)
 	if err != nil || partition < 0 {
-		http.Error(w, "invalid partition", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition")
 		return
 	}
 
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil {
-		http.Error(w, "invalid offset", http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset")
 		return
 	}
 
 	if err := s.broker.Nack(ctx, topic, group, partition, offset, owner, reason); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(http.StatusBadRequest, "FAILED_PRECONDITION", err.Error())
 		return
 	}
 
-	_, _ = w.Write([]byte("nacked\n"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "nacked",
+		"topic":     topic,
+		"group":     group,
+		"partition": partition,
+		"offset":    offset,
+		"owner":     owner,
+		"reason":    reason,
+	})
 }
 
 func (TestRouter) Route(_ context.Context, topic string, msg broker.Message) (broker.RoutingDecision, error) {
