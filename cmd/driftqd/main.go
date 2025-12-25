@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/broker"
+	v1 "github.com/driftq-org/DriftQ-Core/internal/httpapi/v1"
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
@@ -180,7 +181,12 @@ func (s *server) method(get, post http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	if r.Method != http.MethodGet {
+		v1.MethodNotAllowed(w, http.MethodGet)
+		return
+	}
+
+	v1.WriteJSON(w, http.StatusOK, v1.HealthzResponse{Status: "ok"})
 }
 
 func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {

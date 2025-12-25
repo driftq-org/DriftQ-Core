@@ -2,6 +2,10 @@ package v1
 
 import "time"
 
+type HealthzResponse struct {
+	Status string `json:"status"`
+}
+
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
