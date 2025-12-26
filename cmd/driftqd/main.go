@@ -506,11 +506,44 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	var req v1.ConsumeRequest
 
-	topic := r.URL.Query().Get("topic")
-	group := r.URL.Query().Get("group")
-	if strings.TrimSpace(topic) == "" || strings.TrimSpace(group) == "" {
-		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic and group are required")
+	if r.Body != nil && r.ContentLength != 0 {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error())
+			return
+		}
+	} else {
+		q := r.URL.Query()
+		req.Topic = q.Get("topic")
+		req.Group = q.Get("group")
+		req.Owner = q.Get("owner")
+
+		// optional
+		if v := strings.TrimSpace(q.Get("lease_ms")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid lease_ms")
+				return
+			}
+
+			req.LeaseMs = n
+		}
+	}
+
+	topic := strings.TrimSpace(req.Topic)
+	group := strings.TrimSpace(req.Group)
+	owner := strings.TrimSpace(req.Owner)
+
+	if topic == "" || group == "" || owner == "" {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, and owner are required")
+		return
+	}
+
+	if req.LeaseMs < 0 {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid lease_ms")
 		return
 	}
 
@@ -566,7 +599,6 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 					IdempotencyKey:    m.Envelope.IdempotencyKey,
 					TargetTopic:       m.Envelope.TargetTopic,
 					Deadline:          m.Envelope.Deadline,
-					RetryPolicy:       nil, // set below if present
 					PartitionOverride: m.Envelope.PartitionOverride,
 				}
 
