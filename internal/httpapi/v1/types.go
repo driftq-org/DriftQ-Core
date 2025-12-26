@@ -91,3 +91,24 @@ type ResourceExhaustedResponse struct {
 	Reason       string `json:"reason,omitempty"`
 	RetryAfterMs int    `json:"retry_after_ms,omitempty"`
 }
+
+type TopicsCreateRequest struct {
+	Name       string `json:"name"`
+	Partitions int    `json:"partitions,omitempty"` // default = 1 (handler will enforce)
+}
+
+type AckRequest struct {
+	Topic     string `json:"topic"`
+	Group     string `json:"group"`
+	Partition int    `json:"partition"`
+	Offset    int64  `json:"offset"`
+}
+
+type NackRequest struct {
+	Topic     string `json:"topic"`
+	Group     string `json:"group"`
+	Partition int    `json:"partition"`
+	Offset    int64  `json:"offset"`
+	Owner     string `json:"owner"`
+	Reason    string `json:"reason,omitempty"`
+}

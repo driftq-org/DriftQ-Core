@@ -219,11 +219,31 @@ func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	type produceRequest struct {
-		Topic    string           `json:"topic"`
-		Key      string           `json:"key,omitempty"`
-		Value    string           `json:"value"`
-		Envelope *broker.Envelope `json:"envelope,omitempty"`
+	toBrokerEnvelope := func(env *v1.Envelope) *broker.Envelope {
+		if env == nil {
+			return nil
+		}
+
+		out := &broker.Envelope{
+			RunID:             env.RunID,
+			StepID:            env.StepID,
+			ParentStepID:      env.ParentStepID,
+			TenantID:          env.TenantID,
+			IdempotencyKey:    env.IdempotencyKey,
+			TargetTopic:       env.TargetTopic,
+			Deadline:          env.Deadline,
+			PartitionOverride: env.PartitionOverride,
+		}
+
+		if env.RetryPolicy != nil {
+			out.RetryPolicy = &broker.RetryPolicy{
+				MaxAttempts:  env.RetryPolicy.MaxAttempts,
+				BackoffMs:    env.RetryPolicy.BackoffMs,
+				MaxBackoffMs: env.RetryPolicy.MaxBackoffMs,
+			}
+		}
+
+		return out
 	}
 
 	parseDeadline := func(q url.Values) (*time.Time, error) {
@@ -275,9 +295,9 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		return &n, nil
 	}
 
-	var req produceRequest
+	var req v1.ProduceRequest
 
-	// Note: If JSON body exists, use it. Otherwise fall back to query params
+	// Prefer JSON body; fall back to query params
 	if r.Body != nil && r.ContentLength != 0 {
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
@@ -292,7 +312,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		req.Key = q.Get("key")
 		req.Value = q.Get("value")
 
-		env := &broker.Envelope{}
+		env := &v1.Envelope{}
 		anySet := false
 
 		if v := strings.TrimSpace(q.Get("run_id")); v != "" {
@@ -373,7 +393,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if maxAttemptsPtr != nil || backoffPtr != nil || maxBackoffPtr != nil {
-			rp := &broker.RetryPolicy{}
+			rp := &v1.RetryPolicy{}
 
 			if maxAttemptsPtr != nil {
 				if *maxAttemptsPtr < 0 {
@@ -423,7 +443,7 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 	msg := broker.Message{
 		Key:      []byte(req.Key),
 		Value:    []byte(req.Value),
-		Envelope: req.Envelope,
+		Envelope: toBrokerEnvelope(req.Envelope),
 	}
 
 	if err := s.broker.Produce(ctx, req.Topic, msg); err != nil {
@@ -443,13 +463,13 @@ func (s *server) handleProduce(w http.ResponseWriter, r *http.Request) {
 
 			secs := int((retryAfter + time.Second - 1) / time.Second)
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
+
 			v1.WriteJSON(w, http.StatusTooManyRequests, v1.ResourceExhaustedResponse{
 				Error:        "RESOURCE_EXHAUSTED",
 				Message:      err.Error(),
 				Reason:       reason,
 				RetryAfterMs: int(retryAfter / time.Millisecond),
 			})
-
 			return
 		}
 
