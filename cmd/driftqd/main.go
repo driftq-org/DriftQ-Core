@@ -194,14 +194,46 @@ func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
 
 	topics, err := s.broker.ListTopics(ctx)
 	if err != nil {
-		s.writeJSONError(w, http.StatusInternalServerError, "INTERNAL", err.Error(), nil)
+		v1.WriteError(w, http.StatusInternalServerError, "INTERNAL", err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"topics": topics})
+	v1.WriteJSON(w, http.StatusOK, v1.TopicsListResponse{Topics: topics})
 }
 
 func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if name == "" {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "name is required")
+		return
+	}
+
+	partitionsStr := strings.TrimSpace(r.URL.Query().Get("partitions"))
+	if partitionsStr == "" {
+		partitionsStr = "1"
+	}
+
+	partitions, err := strconv.Atoi(partitionsStr)
+	if err != nil || partitions <= 0 {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partitions")
+		return
+	}
+
+	if err := s.broker.CreateTopic(ctx, name, partitions); err != nil {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		return
+	}
+
+	v1.WriteJSON(w, http.StatusCreated, v1.TopicsCreateResponse{
+		Status:     "created",
+		Name:       name,
+		Partitions: partitions,
+	})
+}
+
+func (s *server) handleTopicsCreateo(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
