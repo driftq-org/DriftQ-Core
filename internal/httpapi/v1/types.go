@@ -2,6 +2,13 @@ package v1
 
 import "time"
 
+type ConsumeRequest struct {
+	Topic   string `json:"topic"`
+	Group   string `json:"group"`
+	Owner   string `json:"owner"`
+	LeaseMs int    `json:"lease_ms,omitempty"` // handler will default if 0/missing
+}
+
 type HealthzResponse struct {
 	Status string `json:"status"`
 }
