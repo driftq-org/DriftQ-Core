@@ -11,6 +11,7 @@ type inflightEntry struct {
 	Attempts      int
 	NextDeliverAt time.Time
 	LastError     string
+	Owner         string
 }
 
 // Note: This is for test. This is my "do nothing" brain. It lets me plug something in without changing behavior

@@ -359,6 +359,73 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 }
 
 func (b *InMemoryBroker) AckIfOwner(ctx context.Context, topic, group string, partition int, offset int64, owner string) error {
+	if topic == "" {
+		return errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return errors.New("group cannot be empty")
+	}
+
+	if partition < 0 {
+		return errors.New("partition cannot be negative")
+	}
+
+	if offset < 0 {
+		return errors.New("offset cannot be negative")
+	}
+
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return errors.New("owner cannot be empty")
+	}
+
+	var tenantID, idk string
+	b.mu.Lock()
+
+	ts, ok := b.topics[topic]
+	if !ok {
+		b.mu.Unlock()
+		return errors.New("topic does not exist")
+	}
+
+	if partition >= len(ts.partitions) {
+		b.mu.Unlock()
+		return errors.New("partition out of range")
+	}
+
+	inFlight := b.ensureInFlight(topic, group, partition)
+	e, ok := inFlight[offset]
+	if !ok || e == nil {
+		b.mu.Unlock()
+		return errors.New("message is not in-flight")
+	}
+
+	if strings.TrimSpace(e.Owner) != owner {
+		b.mu.Unlock()
+		return ErrNotOwner
+	}
+
+	if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+		tenantID = e.Msg.Envelope.TenantID
+		idk = e.Msg.Envelope.IdempotencyKey
+	}
+
+	b.mu.Unlock()
+
+	if b.idem != nil && idk != "" {
+		if err := b.idem.ConsumeCommitIfOwner(tenantID, topic, group, idk, owner, nil); err != nil {
+
+			if err == ErrIdempotencyLeaseHeld {
+				return ErrNotOwner
+			}
+
+			if err != ErrIdempotencyNotFound {
+				return err
+			}
+		}
+	}
+
 	return b.Ack(ctx, topic, group, partition, offset)
 }
 
