@@ -186,20 +186,41 @@ func (s *server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleTopicsCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	var req v1.TopicsCreateRequest
 
-	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if r.Body != nil && r.ContentLength != 0 {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error())
+			return
+		}
+	} else {
+		q := r.URL.Query()
+		req.Name = strings.TrimSpace(q.Get("name"))
+
+		if p := strings.TrimSpace(q.Get("partitions")); p != "" {
+			n, err := strconv.Atoi(p)
+			if err != nil {
+				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partitions")
+				return
+			}
+			req.Partitions = n
+		}
+	}
+
+	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "name is required")
 		return
 	}
 
-	partitionsStr := strings.TrimSpace(r.URL.Query().Get("partitions"))
-	if partitionsStr == "" {
-		partitionsStr = "1"
+	partitions := req.Partitions
+	if partitions == 0 {
+		partitions = 1
 	}
 
-	partitions, err := strconv.Atoi(partitionsStr)
-	if err != nil || partitions <= 0 {
+	if partitions <= 0 {
 		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partitions")
 		return
 	}
