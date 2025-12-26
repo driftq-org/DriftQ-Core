@@ -358,6 +358,10 @@ func (b *InMemoryBroker) Ack(_ context.Context, topic, group string, partition i
 	return nil
 }
 
+func (b *InMemoryBroker) AckIfOwner(ctx context.Context, topic, group string, partition int, offset int64, owner string) error {
+	return b.Ack(ctx, topic, group, partition, offset)
+}
+
 func (b *InMemoryBroker) IdempotencyHelper() *IdempotencyConsumerHelper {
 	if b == nil {
 		return nil

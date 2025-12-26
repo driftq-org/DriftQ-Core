@@ -71,6 +71,8 @@ type Broker interface {
 
 	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
 	Nack(_ context.Context, topic, group string, partition int, offset int64, owner string, reason string) error
+
+	AckIfOwner(ctx context.Context, topic, group string, partition int, offset int64, owner string) error
 }
 
 type RetryPolicy struct {
