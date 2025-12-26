@@ -109,6 +109,7 @@ type AckRequest struct {
 	Group     string `json:"group"`
 	Partition int    `json:"partition"`
 	Offset    int64  `json:"offset"`
+	Owner     string `json:"owner"`
 }
 
 type NackRequest struct {

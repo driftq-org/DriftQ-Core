@@ -635,6 +635,7 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		req.Topic = q.Get("topic")
 		req.Group = q.Get("group")
+		req.Owner = q.Get("owner")
 
 		partitionStr := q.Get("partition")
 		offsetStr := q.Get("offset")
@@ -660,9 +661,10 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 
 	topic := strings.TrimSpace(req.Topic)
 	group := strings.TrimSpace(req.Group)
+	owner := strings.TrimSpace(req.Owner)
 
-	if topic == "" || group == "" {
-		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic and group are required")
+	if topic == "" || group == "" || owner == "" {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, and owner are required")
 		return
 	}
 
