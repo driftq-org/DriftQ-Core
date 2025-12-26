@@ -84,3 +84,10 @@ type NackResponse struct {
 	Owner     string `json:"owner"`
 	Reason    string `json:"reason,omitempty"`
 }
+
+type ResourceExhaustedResponse struct {
+	Error        string `json:"error"`
+	Message      string `json:"message"`
+	Reason       string `json:"reason,omitempty"`
+	RetryAfterMs int    `json:"retry_after_ms,omitempty"`
+}

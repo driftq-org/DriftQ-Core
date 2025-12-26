@@ -24,3 +24,9 @@ func MethodNotAllowed(w http.ResponseWriter, allow string) {
 	}
 	WriteError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 }
+
+func ReadJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
