@@ -732,7 +732,28 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 	var req v1.NackRequest
 
 	if r.Body != nil && r.ContentLength != 0 {
-		dec := json.NewDecoder(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "failed to read body: "+err.Error())
+			return
+		}
+
+		// Enforce required fields for JSON (avoids partition/offset defaulting to 0 silently)
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error())
+			return
+		}
+
+		required := []string{"topic", "group", "owner", "partition", "offset"}
+		for _, k := range required {
+			if _, ok := raw[k]; !ok {
+				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", k+" is required")
+				return
+			}
+		}
+
+		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil {
 			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid json body: "+err.Error())
@@ -740,48 +761,41 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		q := r.URL.Query()
+
 		req.Topic = q.Get("topic")
 		req.Group = q.Get("group")
 		req.Owner = q.Get("owner")
 		req.Reason = q.Get("reason")
 
-		partitionStr := q.Get("partition")
-		offsetStr := q.Get("offset")
-
-		if partitionStr != "" {
-			p, err := strconv.Atoi(partitionStr)
-
-			if err != nil {
-				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition")
-				return
-			}
-
-			req.Partition = p
+		partitionStr := strings.TrimSpace(q.Get("partition"))
+		offsetStr := strings.TrimSpace(q.Get("offset"))
+		if partitionStr == "" || offsetStr == "" {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "partition and offset are required")
+			return
 		}
 
-		if offsetStr != "" {
-			o, err := strconv.ParseInt(offsetStr, 10, 64)
-
-			if err != nil {
-				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset")
-				return
-			}
-
-			req.Offset = o
+		p, err := strconv.Atoi(partitionStr)
+		if err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid partition")
+			return
 		}
+		req.Partition = p
+
+		o, err := strconv.ParseInt(offsetStr, 10, 64)
+		if err != nil {
+			v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid offset")
+			return
+		}
+		req.Offset = o
 	}
 
 	topic := strings.TrimSpace(req.Topic)
 	group := strings.TrimSpace(req.Group)
 	owner := strings.TrimSpace(req.Owner)
+	reason := strings.TrimSpace(req.Reason)
 
-	if owner == "" {
-		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "owner is required")
-		return
-	}
-
-	if topic == "" || group == "" {
-		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic and group are required")
+	if topic == "" || group == "" || owner == "" {
+		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "topic, group, and owner are required")
 		return
 	}
 
@@ -795,7 +809,11 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.broker.Nack(ctx, topic, group, req.Partition, req.Offset, owner, req.Reason); err != nil {
+	if err := s.broker.Nack(ctx, topic, group, req.Partition, req.Offset, owner, reason); err != nil {
+		if errors.Is(err, broker.ErrNotOwner) {
+			v1.WriteError(w, http.StatusConflict, "NOT_OWNER", err.Error())
+			return
+		}
 		v1.WriteError(w, http.StatusBadRequest, "FAILED_PRECONDITION", err.Error())
 		return
 	}
@@ -807,7 +825,7 @@ func (s *server) handleNack(w http.ResponseWriter, r *http.Request) {
 		Partition: req.Partition,
 		Offset:    req.Offset,
 		Owner:     owner,
-		Reason:    req.Reason,
+		Reason:    reason,
 	})
 }
 
