@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -17,11 +18,12 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 		return err
 	}
 
+	owner = strings.TrimSpace(owner)
 	if owner == "" {
-		owner = "unknown"
+		owner = "consumer-runner"
 	}
 
-	ch, err := b.Consume(ctx, topic, group)
+	ch, err := b.Consume(ctx, topic, group, owner)
 	if err != nil {
 		return err
 	}
@@ -61,11 +63,10 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 					_ = b.Nack(ctx, topic, group, msg.Partition, msg.Offset, owner, herr.Error())
 					continue
 				}
-				_ = b.Ack(ctx, topic, group, msg.Partition, msg.Offset)
+				_ = b.AckIfOwner(ctx, topic, group, msg.Partition, msg.Offset, owner)
 				continue
 			}
 
-			// Copy fields we will reuse (avoid relying on msg/envelope in goroutines)
 			tenantID := msg.Envelope.TenantID
 			idKey := msg.Envelope.IdempotencyKey
 			part := msg.Partition
@@ -83,13 +84,12 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 			}
 
 			if alreadyDone {
-				_ = b.Ack(ctx, topic, group, part, off)
+				_ = b.AckIfOwner(ctx, topic, group, part, off, owner)
 				continue
 			}
 
 			// 2) Run handler while renewing lease
 			hctx, cancel := context.WithCancel(ctx)
-			deferCancel := true
 
 			renewErr := make(chan error, 1)
 			done := make(chan struct{})
@@ -106,7 +106,6 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 						return
 					case <-t.C:
 						if err := helper.store.ConsumeRenewLease(tenantID, topic, group, idKey, owner, lease); err != nil {
-							// non-blocking signal
 							select {
 							case renewErr <- err:
 							default:
@@ -122,7 +121,6 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 
 			// stop renew loop + wait it out
 			cancel()
-			deferCancel = false
 			<-done
 
 			// If renew failed, we definitely don't Ack.
@@ -134,7 +132,6 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 			}
 
 			if handlerErr != nil {
-				// Mark failure *only if owner*
 				if ferr := helper.store.ConsumeFailIfOwner(tenantID, topic, group, idKey, owner, handlerErr); ferr != nil {
 					_ = b.Nack(ctx, topic, group, part, off, owner, "idem_fail_failed: "+ferr.Error())
 					continue
@@ -149,10 +146,7 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 				continue
 			}
 
-			_ = b.Ack(ctx, topic, group, part, off)
-
-			// In case we ever add defers above, keep this pattern safe
-			_ = deferCancel
+			_ = b.AckIfOwner(ctx, topic, group, part, off, owner)
 		}
 	}
 }

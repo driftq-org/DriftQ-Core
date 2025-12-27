@@ -11,6 +11,11 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
+type consumerStream struct {
+	Owner string
+	Ch    chan Message
+}
+
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
 	mu     sync.RWMutex
@@ -20,7 +25,7 @@ type InMemoryBroker struct {
 	consumerOffsets map[string]map[string]map[int]int64
 
 	// topic -> group -> list of chans
-	consumerChans map[string]map[string][]chan Message
+	consumerChans map[string]map[string][]consumerStream
 
 	rrCursor map[string]map[string]int
 
@@ -67,7 +72,7 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 	return &InMemoryBroker{
 		topics:            make(map[string]*TopicState),
 		consumerOffsets:   make(map[string]map[string]map[int]int64),
-		consumerChans:     make(map[string]map[string][]chan Message),
+		consumerChans:     make(map[string]map[string][]consumerStream),
 		rrCursor:          make(map[string]map[string]int),
 		maxInFlight:       2, // for testing, later can raise if needed!
 		inFlight:          make(map[string]map[string]map[int]map[int64]*inflightEntry),
@@ -198,8 +203,12 @@ func (b *InMemoryBroker) Produce(ctx context.Context, topic string, msg Message)
 	return nil
 }
 
-// Consume returns a channel that will receive all current messages for the given topic, then close. Consumer group is ignored for now.
-func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-chan Message, error) {
+// Consume registers a streaming consumer channel for (topic, group, owner).
+func (b *InMemoryBroker) Consume(ctx context.Context, topic, group, owner string) (<-chan Message, error) {
+	topic = strings.TrimSpace(topic)
+	group = strings.TrimSpace(group)
+	owner = strings.TrimSpace(owner)
+
 	if topic == "" {
 		return nil, errors.New("topic cannot be empty")
 	}
@@ -208,9 +217,14 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 		return nil, errors.New("group cannot be empty (MVP requirement)")
 	}
 
+	if owner == "" {
+		return nil, errors.New("owner cannot be empty (MVP requirement)")
+	}
+
 	out := make(chan Message)
 
-	// Register this consumer channel for streaming, and kick backlog dispatch through dispatchLocked() so inFlight entries are created (required for redelivery)
+	// Register this consumer channel for streaming, and kick backlog dispatch
+	// through dispatchLocked() so inFlight entries are created (required for redelivery).
 	b.mu.Lock()
 	if _, exists := b.topics[topic]; !exists {
 		b.mu.Unlock()
@@ -219,14 +233,17 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 
 	groupChans, ok := b.consumerChans[topic]
 	if !ok {
-		groupChans = make(map[string][]chan Message)
+		groupChans = make(map[string][]consumerStream)
 		b.consumerChans[topic] = groupChans
 	}
 
 	// If this is the FIRST consumer for this group, kick backlog dispatch
 	kick := len(groupChans[group]) == 0
 
-	groupChans[group] = append(groupChans[group], out)
+	groupChans[group] = append(groupChans[group], consumerStream{
+		Owner: owner,
+		Ch:    out,
+	})
 
 	if kick {
 		b.dispatchLocked(topic)
@@ -239,10 +256,10 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group string) (<-ch
 			// Unregister this consumer channel
 			b.mu.Lock()
 			if groupChans, ok := b.consumerChans[topic]; ok {
-				chans := groupChans[group]
-				for i, ch := range chans {
-					if ch == out {
-						groupChans[group] = append(chans[:i], chans[i+1:]...)
+				streams := groupChans[group]
+				for i, st := range streams {
+					if st.Ch == out {
+						groupChans[group] = append(streams[:i], streams[i+1:]...)
 						break
 					}
 				}

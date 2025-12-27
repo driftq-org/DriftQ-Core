@@ -188,7 +188,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					go func(ch chan Message, m Message) {
 						defer func() { _ = recover() }()
 						ch <- m
-					}(ch, m)
+					}(ch.Ch, m)
 				}
 			}
 		}

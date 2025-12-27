@@ -90,7 +90,7 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
 					ch <- m
-				}(ch, send)
+				}(ch.Ch, send)
 			}
 		}
 	}

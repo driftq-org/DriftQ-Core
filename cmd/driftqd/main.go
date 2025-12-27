@@ -522,17 +522,6 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		req.Topic = q.Get("topic")
 		req.Group = q.Get("group")
 		req.Owner = q.Get("owner")
-
-		// optional
-		if v := strings.TrimSpace(q.Get("lease_ms")); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid lease_ms")
-				return
-			}
-
-			req.LeaseMs = n
-		}
 	}
 
 	topic := strings.TrimSpace(req.Topic)
@@ -544,12 +533,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseMs < 0 {
-		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid lease_ms")
-		return
-	}
-
-	ch, err := s.broker.Consume(ctx, topic, group)
+	ch, err := s.broker.Consume(ctx, topic, group, owner)
 	if err != nil {
 		v1.WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
@@ -602,6 +586,7 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 					TargetTopic:       m.Envelope.TargetTopic,
 					Deadline:          m.Envelope.Deadline,
 					PartitionOverride: m.Envelope.PartitionOverride,
+					RetryPolicy:       nil,
 				}
 
 				if m.Envelope.RetryPolicy != nil {
@@ -616,7 +601,6 @@ func (s *server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			if err := enc.Encode(item); err != nil {
 				return
 			}
-
 			flusher.Flush()
 		}
 	}
