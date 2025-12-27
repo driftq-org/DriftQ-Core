@@ -1,8 +1,6 @@
 package broker
 
-import (
-	"time"
-)
+import "time"
 
 func (b *InMemoryBroker) dispatchLocked(topic string) {
 	ts, ok := b.topics[topic]
@@ -15,13 +13,13 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 		return
 	}
 
+	if _, ok := b.rrCursor[topic]; !ok {
+		b.rrCursor[topic] = make(map[string]int)
+	}
+
 	for group, chans := range groupChans {
 		if len(chans) == 0 {
 			continue
-		}
-
-		if _, ok := b.rrCursor[topic]; !ok {
-			b.rrCursor[topic] = make(map[string]int)
 		}
 
 		nextByPart := b.ensureNextIndex(topic, group)
@@ -32,7 +30,7 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				continue
 			}
 
-			// resume after last ack if we haven't initialized next index yet
+			// Initialize next index for this partition if needed (based on last ack)
 			if _, ok := nextByPart[p]; !ok {
 				last := int64(-1)
 				if byTopic, ok := b.consumerOffsets[topic]; ok {
@@ -43,7 +41,6 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 					}
 				}
 
-				// find first message with Offset > last
 				idx := 0
 				for idx < len(ts.partitions[p]) && ts.partitions[p][idx].Offset <= last {
 					idx++
@@ -57,40 +54,45 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				}
 
 				m := ts.partitions[p][nextByPart[p]]
+
+				// If already in-flight, do NOOOTTTT resend from here (redelivery loop handles retries)
+				if _, exists := inflight[m.Offset]; exists {
+					nextByPart[p]++
+					continue
+				}
+
 				nextByPart[p]++
 
 				// pick one consumer in the group (round-robin)
 				idx := b.rrCursor[topic][group] % len(chans)
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-				ch := chans[idx]
+				cs := chans[idx] // consumerStream { Ch, Owner }
 
-				e, ok := inflight[m.Offset]
-				if !ok || e == nil {
-					rs := b.ensureRetryState(topic, group, p)
-
-					lastErr := ""
-					if st, ok := rs[m.Offset]; ok && st != nil {
-						lastErr = st.LastError
-					}
-
-					e = &inflightEntry{
-						Msg:       m,
-						SentAt:    time.Now(),
-						Attempts:  1,
-						LastError: lastErr,
-					}
-					inflight[m.Offset] = e
+				rs := b.ensureRetryState(topic, group, p)
+				lastErr := ""
+				if st, ok := rs[m.Offset]; ok && st != nil {
+					lastErr = st.LastError
 				}
+
+				e := &inflightEntry{
+					Msg:       m,
+					SentAt:    time.Now(),
+					Attempts:  1,
+					LastError: lastErr,
+					Owner:     cs.Owner,
+				}
+				inflight[m.Offset] = e
 
 				// Build message to send (Attempts and LastError come from inflight entry)
 				send := m
 				send.Attempts = e.Attempts
 				send.LastError = e.LastError
 
-				go func(ch chan Message, m Message) {
+				ch := cs.Ch
+				go func(m Message) {
 					defer func() { _ = recover() }()
 					ch <- m
-				}(ch.Ch, send)
+				}(send)
 			}
 		}
 	}
