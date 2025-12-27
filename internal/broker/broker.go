@@ -11,11 +11,14 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
+// TODO: Move to types
 type consumerStream struct {
 	Owner string
+	Lease time.Duration
 	Ch    chan Message
 }
 
+// TODO: Move to types
 // InMemoryBroker is our first implementation. For sure later we'll replace pieces with WAL, scheduler, partitions, etc
 type InMemoryBroker struct {
 	mu     sync.RWMutex
@@ -242,6 +245,7 @@ func (b *InMemoryBroker) Consume(ctx context.Context, topic, group, owner string
 
 	groupChans[group] = append(groupChans[group], consumerStream{
 		Owner: owner,
+		Lease: 2 * time.Second,
 		Ch:    out,
 	})
 
@@ -677,9 +681,23 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		}
 	}
 
-	// 4) Make it eligible for immediate redelivery (NOT an ack)
+	// 4) Make it eligible for immediate redelivery (respect per-consumer lease)
 	e.NextDeliverAt = time.Time{}
-	e.SentAt = now.Add(-b.ackTimeout)
+
+	lease := b.ackTimeout
+	if groupStreams, ok := b.consumerChans[topic]; ok {
+		if streams, ok := groupStreams[group]; ok {
+			for _, st := range streams {
+				if strings.TrimSpace(st.Owner) == strings.TrimSpace(e.Owner) && st.Lease > 0 {
+					lease = st.Lease
+					break
+				}
+			}
+		}
+	}
+
+	// Push SentAt far enough back so redelivery sees it as expired *now*
+	e.SentAt = now.Add(-lease - time.Millisecond)
 
 	// 5) Optional: resend now
 	b.redeliverExpiredLocked()
@@ -833,4 +851,87 @@ func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Mess
 	b.dispatchLocked(topic)
 
 	return nil
+}
+
+func (b *InMemoryBroker) ConsumeWithLease(ctx context.Context, topic, group, owner string, lease time.Duration) (<-chan Message, error) {
+	topic = strings.TrimSpace(topic)
+	group = strings.TrimSpace(group)
+	owner = strings.TrimSpace(owner)
+
+	if topic == "" {
+		return nil, errors.New("topic cannot be empty")
+	}
+
+	if group == "" {
+		return nil, errors.New("group cannot be empty (MVP requirement)")
+	}
+
+	if owner == "" {
+		return nil, errors.New("owner cannot be empty (MVP requirement)")
+	}
+
+	if lease <= 0 {
+		lease = 2 * time.Second
+	}
+
+	out := make(chan Message)
+
+	b.mu.Lock()
+	if _, exists := b.topics[topic]; !exists {
+		b.mu.Unlock()
+		return nil, errors.New("topic does not exist")
+	}
+
+	groupChans, ok := b.consumerChans[topic]
+	if !ok {
+		groupChans = make(map[string][]consumerStream)
+		b.consumerChans[topic] = groupChans
+	}
+
+	kick := len(groupChans[group]) == 0
+
+	groupChans[group] = append(groupChans[group], consumerStream{
+		Owner: owner,
+		Lease: lease,
+		Ch:    out,
+	})
+
+	if kick {
+		b.dispatchLocked(topic)
+	}
+	b.mu.Unlock()
+
+	go func() {
+		defer func() {
+			b.mu.Lock()
+			if groupChans, ok := b.consumerChans[topic]; ok {
+				streams := groupChans[group]
+				for i, st := range streams {
+					if st.Ch == out {
+						groupChans[group] = append(streams[:i], streams[i+1:]...)
+						break
+					}
+				}
+
+				if len(groupChans[group]) == 0 {
+					delete(groupChans, group)
+				}
+
+				if cursors, ok := b.rrCursor[topic]; ok {
+					if _, ok := groupChans[group]; !ok {
+						delete(cursors, group)
+					} else if cur, ok := cursors[group]; ok && cur >= len(groupChans[group]) {
+						cursors[group] = cur % len(groupChans[group])
+					}
+				}
+			}
+			b.mu.Unlock()
+
+			close(out)
+		}()
+
+		<-ctx.Done()
+	}()
+
+	return out, nil
 }

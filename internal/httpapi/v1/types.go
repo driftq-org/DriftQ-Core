@@ -6,7 +6,7 @@ type ConsumeRequest struct {
 	Topic   string `json:"topic"`
 	Group   string `json:"group"`
 	Owner   string `json:"owner"`
-	LeaseMs int    `json:"lease_ms,omitempty"` // handler will default if 0/missing
+	LeaseMs int64  `json:"lease_ms,omitempty"` // handler will default if 0/missing
 }
 
 type HealthzResponse struct {

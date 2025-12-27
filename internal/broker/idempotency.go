@@ -639,3 +639,25 @@ func (s *IdempotencyStore) ConsumeFailIfOwner(tenantID, topic, group, key, owner
 
 	return nil
 }
+
+func (s *IdempotencyStore) ConsumeCheck(tenantID, topic, group, key string) (st IdempotencyStatus, ok bool) {
+	if key == "" {
+		return IdempotencyStatus{}, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupLocked(time.Now())
+
+	k := idempotencyKey{
+		Scope:    IdemScopeConsume,
+		TenantID: tenantID,
+		Topic:    topic,
+		Group:    group,
+		Key:      key,
+	}
+
+	st, ok = s.items[k]
+	return st, ok
+}

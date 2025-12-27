@@ -62,17 +62,14 @@ type Router interface {
 	Route(ctx context.Context, topic string, msg Message) (RoutingDecision, error)
 }
 
-// Broker is the core interface for the MVP message broker
 type Broker interface {
 	CreateTopic(ctx context.Context, name string, partitions int) error
 	ListTopics(ctx context.Context) ([]string, error)
-
 	Produce(ctx context.Context, topic string, msg Message) error
 	Consume(ctx context.Context, topic, group, owner string) (<-chan Message, error)
-
+	ConsumeWithLease(ctx context.Context, topic, group, owner string, lease time.Duration) (<-chan Message, error)
 	Ack(ctx context.Context, topic, group string, partition int, offset int64) error
 	Nack(_ context.Context, topic, group string, partition int, offset int64, owner string, reason string) error
-
 	AckIfOwner(ctx context.Context, topic, group string, partition int, offset int64, owner string) error
 }
 

@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
@@ -43,6 +44,19 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 				continue
 			}
 
+			leaseForOwner := func(owner string) time.Duration {
+				lease := b.ackTimeout
+				own := strings.TrimSpace(owner)
+
+				for _, st := range chans {
+					if strings.TrimSpace(st.Owner) == own && st.Lease > 0 {
+						lease = st.Lease
+						break
+					}
+				}
+				return lease
+			}
+
 			for partition, inflight := range byPart {
 				for offset, e := range inflight {
 					if e == nil {
@@ -50,29 +64,26 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						continue
 					}
 
-					// Not yet timed out
-					if now.Sub(e.SentAt) < b.ackTimeout {
+					// Not yet timed out (use per-consumer lease if available)
+					lease := leaseForOwner(e.Owner)
+					if now.Sub(e.SentAt) < lease {
 						continue
 					}
 
 					// If it timed out without an explicit Nack, record ack_timeout as last_error
-					// But don't overwrite a real error reason (e.g. "boom") if one already exists
 					if e.LastError == "" {
 						e.LastError = "ack_timeout"
 
-						// update stored msg copy too to keep stuff consistent
 						m := e.Msg
 						m.LastError = e.LastError
 						e.Msg = m
 
-						// update retryState map (so dispatch can seed after restart)
 						rs := b.ensureRetryState(topic, group, partition)
 						rs[offset] = &retryStateEntry{
 							LastError:   e.LastError,
 							LastErrorAt: now,
 						}
 
-						// persist to WAL
 						if b.wal != nil {
 							at := now
 							_ = b.wal.Append(storage.Entry{
@@ -100,14 +111,13 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 
 					// DLQ routing when MaxAttempts reached (STRICT: no drop unless DLQ publish succeeds)
 					if rp != nil && rp.MaxAttempts > 0 && e.Attempts >= rp.MaxAttempts {
-						// Build a fresh message that includes the latest attempt/error state
 						dlqMsg := e.Msg
 						dlqMsg.Attempts = e.Attempts
 						dlqMsg.LastError = e.LastError
 
 						var envCopy *Envelope
 						if e.Msg.Envelope != nil {
-							tmp := *e.Msg.Envelope // do not forget that this is a shallow copy (enough for our DLQ metadata use)
+							tmp := *e.Msg.Envelope
 							envCopy = &tmp
 						} else {
 							envCopy = &Envelope{}
@@ -123,9 +133,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						}
 						dlqMsg.Envelope = envCopy
 
-						// 1) Publish to DLQ
 						if err := b.publishToDLQLocked(context.Background(), topic, dlqMsg); err != nil {
-							// IMPORTANT: preserve original error, append DLQ failure info
 							e.LastError = appendLastError(e.LastError, "dlq_publish_failed: "+err.Error())
 
 							m := e.Msg
@@ -149,30 +157,27 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 							continue
 						}
 
-						// 2) Remove from inflight so we stop redelivering it
 						delete(inflight, offset)
-
-						// 3) Advance offset (persist) so restart won't resurrect it
 						_ = b.advanceOffsetLocked(topic, group, partition, offset)
-
-						// 4) Purge stale retry state for this offset
 						b.purgeRetryStateLocked(topic, group, partition, offset)
-
 						continue
 					}
 
-					// pick one consumer in the group (round-robin!)
+					// pick one consumer in the group (round-robin)
 					idx := b.rrCursor[topic][group] % len(chans)
 					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-					ch := chans[idx]
+					cs := chans[idx]
+
+					// IMPORTANT: update owner to the consumer we're delivering to
+					e.Owner = cs.Owner
 
 					// update inflight bookkeeping (source of truth)
 					e.SentAt = now
 					e.Attempts++
 
-					// Backoff scheduling (for the next eligible retry send time)
+					// Backoff scheduling (for next retry eligibility)
 					if rp != nil && (rp.BackoffMs > 0 || rp.MaxBackoffMs > 0) {
-						retryNumber := e.Attempts - 1 // attempt=2 => retry#1, attempt=3 => retry#2 ...
+						retryNumber := e.Attempts - 1
 						backoff := computeBackoff(rp, retryNumber)
 						e.NextDeliverAt = now.Add(backoff)
 					} else {
@@ -188,7 +193,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					go func(ch chan Message, m Message) {
 						defer func() { _ = recover() }()
 						ch <- m
-					}(ch.Ch, m)
+					}(cs.Ch, m)
 				}
 			}
 		}

@@ -13,7 +13,7 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 		return nil
 	}
 
-	// If we're running Option-B, the lease must be sane. Validate once, up front.
+	// If we're running Option-B, the lease must be sane. Validate once, up front
 	if err := validateLease(lease); err != nil {
 		return err
 	}
@@ -23,7 +23,7 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 		owner = "consumer-runner"
 	}
 
-	ch, err := b.Consume(ctx, topic, group, owner)
+	ch, err := b.ConsumeWithLease(ctx, topic, group, owner, lease)
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (b *InMemoryBroker) RunConsumerWithIdempotency(ctx context.Context, topic, 
 
 func validateLease(lease time.Duration) error {
 	const minLease = 250 * time.Millisecond
-	const maxLease = 10 * time.Minute // can/should tweak this
+	const maxLease = 10 * time.Minute
 
 	if lease <= 0 {
 		return ErrIdempotencyBadLease
