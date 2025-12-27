@@ -168,6 +168,63 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 					cs := chans[idx]
 
+					// Use the lease for the target consumer (not the previous owner)
+					targetLease := cs.Lease
+					if targetLease <= 0 {
+						targetLease = b.ackTimeout
+					}
+
+					// CONSUME-SCOPE BeginLease gate (consumer-boundary idempotency)
+					// IMPORTANT: do this BEFORE changing e.Owner.
+					if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+						tenantID := e.Msg.Envelope.TenantID
+						idk := e.Msg.Envelope.IdempotencyKey
+
+						alreadyDone, _, berr := b.idem.ConsumeBeginLease(tenantID, topic, group, idk, cs.Owner, targetLease)
+						if berr != nil {
+							reason := "idem_begin_failed: " + berr.Error()
+							if berr == ErrIdempotencyLeaseHeld {
+								reason = "idem_lease_held"
+							}
+
+							// Update error so the next delivery shows *why* it didn't move
+							e.LastError = appendLastError(e.LastError, reason)
+
+							m := e.Msg
+							m.LastError = e.LastError
+							e.Msg = m
+
+							rs := b.ensureRetryState(topic, group, partition)
+							rs[offset] = &retryStateEntry{LastError: e.LastError, LastErrorAt: now}
+							if b.wal != nil {
+								at := now
+								_ = b.wal.Append(storage.Entry{
+									Type:        storage.RecordTypeRetryState,
+									Topic:       topic,
+									Group:       group,
+									Partition:   partition,
+									Offset:      offset,
+									LastError:   e.LastError,
+									LastErrorAt: &at,
+								})
+							}
+
+							// Don't spin hot — push next attempt a bit.
+							if e.NextDeliverAt.IsZero() || e.NextDeliverAt.Before(now.Add(100*time.Millisecond)) {
+								e.NextDeliverAt = now.Add(100 * time.Millisecond)
+							}
+							continue
+						}
+
+						if alreadyDone {
+							// Someone already finished it: stop retrying it and advance offset.
+							delete(inflight, offset)
+							_ = b.advanceOffsetLocked(topic, group, partition, offset)
+							b.purgeRetryStateLocked(topic, group, partition, offset)
+							continue
+						}
+					}
+
 					// IMPORTANT: update owner to the consumer we're delivering to
 					e.Owner = cs.Owner
 

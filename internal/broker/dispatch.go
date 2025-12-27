@@ -61,7 +61,7 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				nextByPart[p]++
 
 				// If consume-scope idempotency is already COMMITTED for this (tenant,topic,group,key),
-				// treat this message as already done and advance the group's offset without delivering
+				// treat this message as already done and advance the group's offset without delivering.
 				if b.idem != nil && m.Envelope != nil && m.Envelope.IdempotencyKey != "" {
 					tenantID := m.Envelope.TenantID
 					idk := m.Envelope.IdempotencyKey
@@ -112,6 +112,90 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
 				cs := chans[idx]
 
+				now := time.Now()
+
+				// Determine lease for this owner (defaults to broker ackTimeout)
+				lease := cs.Lease
+				if lease <= 0 {
+					lease = b.ackTimeout
+				}
+
+				// CONSUME-SCOPE BeginLease gate (consumer-boundary idempotency)
+				if b.idem != nil && m.Envelope != nil && m.Envelope.IdempotencyKey != "" {
+					tenantID := m.Envelope.TenantID
+					idk := m.Envelope.IdempotencyKey
+
+					alreadyDone, _, berr := b.idem.ConsumeBeginLease(tenantID, topic, group, idk, cs.Owner, lease)
+					if berr != nil {
+						reason := "idem_begin_failed: " + berr.Error()
+						if berr == ErrIdempotencyLeaseHeld {
+							reason = "idem_lease_held"
+						}
+
+						// Persist retry state so LastError shows up consistently
+						rs := b.ensureRetryState(topic, group, p)
+						rs[m.Offset] = &retryStateEntry{LastError: reason, LastErrorAt: now}
+
+						if b.wal != nil {
+							at := now
+							_ = b.wal.Append(storage.Entry{
+								Type:        storage.RecordTypeRetryState,
+								Topic:       topic,
+								Group:       group,
+								Partition:   p,
+								Offset:      m.Offset,
+								LastError:   reason,
+								LastErrorAt: &at,
+							})
+						}
+
+						// Important: don't "lose" the message since nextByPart already advanced
+						// Put it into inflight as pending so the redelivery loop retries later
+						inflight[m.Offset] = &inflightEntry{
+							Msg:           m,
+							SentAt:        now.Add(-lease - time.Millisecond), // expired immediately
+							Attempts:      0,
+							LastError:     reason,
+							Owner:         "",
+							NextDeliverAt: now.Add(100 * time.Millisecond),
+						}
+						continue
+					}
+
+					if alreadyDone {
+						// Skip delivering and advance the group offset (same as committed fast-path)
+						if _, ok := b.consumerOffsets[topic]; !ok {
+							b.consumerOffsets[topic] = make(map[string]map[int]int64)
+						}
+						if _, ok := b.consumerOffsets[topic][group]; !ok {
+							b.consumerOffsets[topic][group] = make(map[int]int64)
+						}
+
+						cur, ok := b.consumerOffsets[topic][group][p]
+						if !ok {
+							cur = -1
+						}
+
+						if m.Offset > cur {
+							if b.wal != nil {
+								if err := b.wal.Append(storage.Entry{
+									Type:      storage.RecordTypeOffset,
+									Topic:     topic,
+									Group:     group,
+									Partition: p,
+									Offset:    m.Offset,
+								}); err != nil {
+									return
+								}
+							}
+							b.consumerOffsets[topic][group][p] = m.Offset
+						}
+
+						b.purgeRetryStateLocked(topic, group, p, m.Offset)
+						continue
+					}
+				}
+
 				rs := b.ensureRetryState(topic, group, p)
 				lastErr := ""
 				if st, ok := rs[m.Offset]; ok && st != nil {
@@ -120,7 +204,7 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 
 				e := &inflightEntry{
 					Msg:       m,
-					SentAt:    time.Now(),
+					SentAt:    now,
 					Attempts:  1,
 					LastError: lastErr,
 					Owner:     cs.Owner,
