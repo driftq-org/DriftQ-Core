@@ -592,6 +592,10 @@ func (b *InMemoryBroker) Nack(_ context.Context, topic, group string, partition 
 		return errors.New("message is not in-flight")
 	}
 
+	if strings.TrimSpace(e.Owner) != owner {
+		return ErrNotOwner
+	}
+
 	now := time.Now()
 
 	// Merge with any existing error (keep original + add new detail)
