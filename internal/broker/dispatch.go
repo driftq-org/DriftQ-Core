@@ -13,13 +13,13 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 		return
 	}
 
-	if _, ok := b.rrCursor[topic]; !ok {
-		b.rrCursor[topic] = make(map[string]int)
-	}
-
 	for group, chans := range groupChans {
 		if len(chans) == 0 {
 			continue
+		}
+
+		if _, ok := b.rrCursor[topic]; !ok {
+			b.rrCursor[topic] = make(map[string]int)
 		}
 
 		nextByPart := b.ensureNextIndex(topic, group)
@@ -30,7 +30,7 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				continue
 			}
 
-			// Initialize next index for this partition if needed (based on last ack)
+			// Resume after last ack if we haven't initialized next index yet
 			if _, ok := nextByPart[p]; !ok {
 				last := int64(-1)
 				if byTopic, ok := b.consumerOffsets[topic]; ok {
@@ -54,19 +54,17 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				}
 
 				m := ts.partitions[p][nextByPart[p]]
+				nextByPart[p]++
 
-				// If already in-flight, do NOOOTTTT resend from here (redelivery loop handles retries)
-				if _, exists := inflight[m.Offset]; exists {
-					nextByPart[p]++
+				// If it's already in-flight, DO NOT deliver it again here. Redelivery loop owns retries
+				if e, ok := inflight[m.Offset]; ok && e != nil {
 					continue
 				}
-
-				nextByPart[p]++
 
 				// pick one consumer in the group (round-robin)
 				idx := b.rrCursor[topic][group] % len(chans)
 				b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-				cs := chans[idx] // consumerStream { Ch, Owner }
+				cs := chans[idx]
 
 				rs := b.ensureRetryState(topic, group, p)
 				lastErr := ""
@@ -88,11 +86,10 @@ func (b *InMemoryBroker) dispatchLocked(topic string) {
 				send.Attempts = e.Attempts
 				send.LastError = e.LastError
 
-				ch := cs.Ch
-				go func(m Message) {
+				go func(ch chan Message, m Message) {
 					defer func() { _ = recover() }()
 					ch <- m
-				}(send)
+				}(cs.Ch, send)
 			}
 		}
 	}
