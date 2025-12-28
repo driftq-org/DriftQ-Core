@@ -2,6 +2,13 @@ package v1
 
 import "time"
 
+type ConsumeRequest struct {
+	Topic   string `json:"topic"`
+	Group   string `json:"group"`
+	Owner   string `json:"owner"`
+	LeaseMs int64  `json:"lease_ms,omitempty"` // handler will default if 0/missing
+}
+
 type HealthzResponse struct {
 	Status string `json:"status"`
 }
@@ -102,6 +109,7 @@ type AckRequest struct {
 	Group     string `json:"group"`
 	Partition int    `json:"partition"`
 	Offset    int64  `json:"offset"`
+	Owner     string `json:"owner"`
 }
 
 type NackRequest struct {

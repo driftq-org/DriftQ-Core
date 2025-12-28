@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
@@ -43,6 +44,26 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 				continue
 			}
 
+			leaseForOwner := func(owner string) time.Duration {
+				lease := b.ackTimeout
+				own := strings.TrimSpace(owner)
+
+				for _, st := range chans {
+					if strings.TrimSpace(st.Owner) == own && st.Lease > 0 {
+						lease = st.Lease
+						break
+					}
+				}
+				return lease
+			}
+
+			leaseForStream := func(st consumerStream) time.Duration {
+				if st.Lease > 0 {
+					return st.Lease
+				}
+				return b.ackTimeout
+			}
+
 			for partition, inflight := range byPart {
 				for offset, e := range inflight {
 					if e == nil {
@@ -50,29 +71,26 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						continue
 					}
 
-					// Not yet timed out
-					if now.Sub(e.SentAt) < b.ackTimeout {
+					// Not yet timed out (use per-consumer lease if available)
+					lease := leaseForOwner(e.Owner)
+					if now.Sub(e.SentAt) < lease {
 						continue
 					}
 
 					// If it timed out without an explicit Nack, record ack_timeout as last_error
-					// But don't overwrite a real error reason (e.g. "boom") if one already exists
 					if e.LastError == "" {
 						e.LastError = "ack_timeout"
 
-						// update stored msg copy too to keep stuff consistent
 						m := e.Msg
 						m.LastError = e.LastError
 						e.Msg = m
 
-						// update retryState map (so dispatch can seed after restart)
 						rs := b.ensureRetryState(topic, group, partition)
 						rs[offset] = &retryStateEntry{
 							LastError:   e.LastError,
 							LastErrorAt: now,
 						}
 
-						// persist to WAL
 						if b.wal != nil {
 							at := now
 							_ = b.wal.Append(storage.Entry{
@@ -98,16 +116,28 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						rp = e.Msg.Envelope.RetryPolicy
 					}
 
+					// If consume-scope idempotency is already COMMITTED, skip redelivery and advance offset.
+					if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+						tenantID := e.Msg.Envelope.TenantID
+						idk := e.Msg.Envelope.IdempotencyKey
+
+						if st, ok := b.idem.ConsumeCheck(tenantID, topic, group, idk); ok && st.Status == IdemStatusCommitted {
+							delete(inflight, offset)
+							_ = b.advanceOffsetLocked(topic, group, partition, offset)
+							b.purgeRetryStateLocked(topic, group, partition, offset)
+							continue
+						}
+					}
+
 					// DLQ routing when MaxAttempts reached (STRICT: no drop unless DLQ publish succeeds)
 					if rp != nil && rp.MaxAttempts > 0 && e.Attempts >= rp.MaxAttempts {
-						// Build a fresh message that includes the latest attempt/error state
 						dlqMsg := e.Msg
 						dlqMsg.Attempts = e.Attempts
 						dlqMsg.LastError = e.LastError
 
 						var envCopy *Envelope
 						if e.Msg.Envelope != nil {
-							tmp := *e.Msg.Envelope // do not forget that this is a shallow copy (enough for our DLQ metadata use)
+							tmp := *e.Msg.Envelope
 							envCopy = &tmp
 						} else {
 							envCopy = &Envelope{}
@@ -123,9 +153,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 						}
 						dlqMsg.Envelope = envCopy
 
-						// 1) Publish to DLQ
 						if err := b.publishToDLQLocked(context.Background(), topic, dlqMsg); err != nil {
-							// IMPORTANT: preserve original error, append DLQ failure info
 							e.LastError = appendLastError(e.LastError, "dlq_publish_failed: "+err.Error())
 
 							m := e.Msg
@@ -149,30 +177,97 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 							continue
 						}
 
-						// 2) Remove from inflight so we stop redelivering it
 						delete(inflight, offset)
-
-						// 3) Advance offset (persist) so restart won't resurrect it
 						_ = b.advanceOffsetLocked(topic, group, partition, offset)
-
-						// 4) Purge stale retry state for this offset
 						b.purgeRetryStateLocked(topic, group, partition, offset)
-
 						continue
 					}
 
-					// pick one consumer in the group (round-robin!)
-					idx := b.rrCursor[topic][group] % len(chans)
-					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-					ch := chans[idx]
+					// pick one consumer in the group (round-robin)
+					cs := consumerStream{}
+					chosenIdx := -1
+
+					// If idempotency_key exists, MUST BeginLease for the consumer we’re about to deliver to.
+					if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+						tenantID := e.Msg.Envelope.TenantID
+						idk := e.Msg.Envelope.IdempotencyKey
+
+						start := b.rrCursor[topic][group] % len(chans)
+
+						for i := 0; i < len(chans); i++ {
+							idx := (start + i) % len(chans)
+							cand := chans[idx]
+
+							lease := leaseForStream(cand)
+
+							alreadyDone, _, err := b.idem.ConsumeBeginLease(tenantID, topic, group, idk, cand.Owner, lease)
+							if err == ErrIdempotencyLeaseHeld {
+								continue // try another consumer
+							}
+							if err != nil {
+								// don’t send; try again next tick
+								e.LastError = appendLastError(e.LastError, "idem_begin_failed: "+err.Error())
+								m := e.Msg
+								m.LastError = e.LastError
+								e.Msg = m
+
+								rs := b.ensureRetryState(topic, group, partition)
+								rs[offset] = &retryStateEntry{LastError: e.LastError, LastErrorAt: now}
+								if b.wal != nil {
+									at := now
+									_ = b.wal.Append(storage.Entry{
+										Type:        storage.RecordTypeRetryState,
+										Topic:       topic,
+										Group:       group,
+										Partition:   partition,
+										Offset:      offset,
+										LastError:   e.LastError,
+										LastErrorAt: &at,
+									})
+								}
+
+								chosenIdx = -1
+								break
+							}
+
+							if alreadyDone {
+								// Treat as done: advance and stop redelivering it
+								delete(inflight, offset)
+								_ = b.advanceOffsetLocked(topic, group, partition, offset)
+								b.purgeRetryStateLocked(topic, group, partition, offset)
+								chosenIdx = -2 // sentinel
+								break
+							}
+
+							cs = cand
+							chosenIdx = idx
+							break
+						}
+
+						if chosenIdx == -2 {
+							continue
+						}
+						if chosenIdx < 0 {
+							continue
+						}
+
+						b.rrCursor[topic][group] = (chosenIdx + 1) % len(chans)
+					} else {
+						idx := b.rrCursor[topic][group] % len(chans)
+						b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+						cs = chans[idx]
+					}
+
+					// IMPORTANT: update owner to the consumer we're delivering to
+					e.Owner = cs.Owner
 
 					// update inflight bookkeeping (source of truth)
 					e.SentAt = now
 					e.Attempts++
 
-					// Backoff scheduling (for the next eligible retry send time)
+					// Backoff scheduling (for next retry eligibility)
 					if rp != nil && (rp.BackoffMs > 0 || rp.MaxBackoffMs > 0) {
-						retryNumber := e.Attempts - 1 // attempt=2 => retry#1, attempt=3 => retry#2 ...
+						retryNumber := e.Attempts - 1
 						backoff := computeBackoff(rp, retryNumber)
 						e.NextDeliverAt = now.Add(backoff)
 					} else {
@@ -188,7 +283,7 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					go func(ch chan Message, m Message) {
 						defer func() { _ = recover() }()
 						ch <- m
-					}(ch, m)
+					}(cs.Ch, m)
 				}
 			}
 		}
