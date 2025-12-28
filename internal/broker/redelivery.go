@@ -57,6 +57,13 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 				return lease
 			}
 
+			leaseForStream := func(st consumerStream) time.Duration {
+				if st.Lease > 0 {
+					return st.Lease
+				}
+				return b.ackTimeout
+			}
+
 			for partition, inflight := range byPart {
 				for offset, e := range inflight {
 					if e == nil {
@@ -107,6 +114,19 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					var rp *RetryPolicy
 					if e.Msg.Envelope != nil {
 						rp = e.Msg.Envelope.RetryPolicy
+					}
+
+					// If consume-scope idempotency is already COMMITTED, skip redelivery and advance offset.
+					if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
+						tenantID := e.Msg.Envelope.TenantID
+						idk := e.Msg.Envelope.IdempotencyKey
+
+						if st, ok := b.idem.ConsumeCheck(tenantID, topic, group, idk); ok && st.Status == IdemStatusCommitted {
+							delete(inflight, offset)
+							_ = b.advanceOffsetLocked(topic, group, partition, offset)
+							b.purgeRetryStateLocked(topic, group, partition, offset)
+							continue
+						}
 					}
 
 					// DLQ routing when MaxAttempts reached (STRICT: no drop unless DLQ publish succeeds)
@@ -164,65 +184,78 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 					}
 
 					// pick one consumer in the group (round-robin)
-					idx := b.rrCursor[topic][group] % len(chans)
-					b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
-					cs := chans[idx]
+					cs := consumerStream{}
+					chosenIdx := -1
 
-					// Use the lease for the target consumer (not the previous owner)
-					targetLease := cs.Lease
-					if targetLease <= 0 {
-						targetLease = b.ackTimeout
-					}
-
-					// CONSUME-SCOPE BeginLease gate (consumer-boundary idempotency)
-					// IMPORTANT: do this BEFORE changing e.Owner.
+					// If idempotency_key exists, MUST BeginLease for the consumer we’re about to deliver to.
 					if b.idem != nil && e.Msg.Envelope != nil && e.Msg.Envelope.IdempotencyKey != "" {
 						tenantID := e.Msg.Envelope.TenantID
 						idk := e.Msg.Envelope.IdempotencyKey
 
-						alreadyDone, _, berr := b.idem.ConsumeBeginLease(tenantID, topic, group, idk, cs.Owner, targetLease)
-						if berr != nil {
-							reason := "idem_begin_failed: " + berr.Error()
-							if berr == ErrIdempotencyLeaseHeld {
-								reason = "idem_lease_held"
+						start := b.rrCursor[topic][group] % len(chans)
+
+						for i := 0; i < len(chans); i++ {
+							idx := (start + i) % len(chans)
+							cand := chans[idx]
+
+							lease := leaseForStream(cand)
+
+							alreadyDone, _, err := b.idem.ConsumeBeginLease(tenantID, topic, group, idk, cand.Owner, lease)
+							if err == ErrIdempotencyLeaseHeld {
+								continue // try another consumer
+							}
+							if err != nil {
+								// don’t send; try again next tick
+								e.LastError = appendLastError(e.LastError, "idem_begin_failed: "+err.Error())
+								m := e.Msg
+								m.LastError = e.LastError
+								e.Msg = m
+
+								rs := b.ensureRetryState(topic, group, partition)
+								rs[offset] = &retryStateEntry{LastError: e.LastError, LastErrorAt: now}
+								if b.wal != nil {
+									at := now
+									_ = b.wal.Append(storage.Entry{
+										Type:        storage.RecordTypeRetryState,
+										Topic:       topic,
+										Group:       group,
+										Partition:   partition,
+										Offset:      offset,
+										LastError:   e.LastError,
+										LastErrorAt: &at,
+									})
+								}
+
+								chosenIdx = -1
+								break
 							}
 
-							// Update error so the next delivery shows *why* it didn't move
-							e.LastError = appendLastError(e.LastError, reason)
-
-							m := e.Msg
-							m.LastError = e.LastError
-							e.Msg = m
-
-							rs := b.ensureRetryState(topic, group, partition)
-							rs[offset] = &retryStateEntry{LastError: e.LastError, LastErrorAt: now}
-							if b.wal != nil {
-								at := now
-								_ = b.wal.Append(storage.Entry{
-									Type:        storage.RecordTypeRetryState,
-									Topic:       topic,
-									Group:       group,
-									Partition:   partition,
-									Offset:      offset,
-									LastError:   e.LastError,
-									LastErrorAt: &at,
-								})
+							if alreadyDone {
+								// Treat as done: advance and stop redelivering it
+								delete(inflight, offset)
+								_ = b.advanceOffsetLocked(topic, group, partition, offset)
+								b.purgeRetryStateLocked(topic, group, partition, offset)
+								chosenIdx = -2 // sentinel
+								break
 							}
 
-							// Don't spin hot — push next attempt a bit.
-							if e.NextDeliverAt.IsZero() || e.NextDeliverAt.Before(now.Add(100*time.Millisecond)) {
-								e.NextDeliverAt = now.Add(100 * time.Millisecond)
-							}
+							cs = cand
+							chosenIdx = idx
+							break
+						}
+
+						if chosenIdx == -2 {
+							continue
+						}
+						if chosenIdx < 0 {
 							continue
 						}
 
-						if alreadyDone {
-							// Someone already finished it: stop retrying it and advance offset.
-							delete(inflight, offset)
-							_ = b.advanceOffsetLocked(topic, group, partition, offset)
-							b.purgeRetryStateLocked(topic, group, partition, offset)
-							continue
-						}
+						b.rrCursor[topic][group] = (chosenIdx + 1) % len(chans)
+					} else {
+						idx := b.rrCursor[topic][group] % len(chans)
+						b.rrCursor[topic][group] = (b.rrCursor[topic][group] + 1) % len(chans)
+						cs = chans[idx]
 					}
 
 					// IMPORTANT: update owner to the consumer we're delivering to
