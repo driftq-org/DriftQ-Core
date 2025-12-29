@@ -35,10 +35,24 @@ type TestRouter struct{}
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
+	walPath := flag.String("wal", "driftq.wal", "path to WAL file")
+	resetWAL := flag.Bool("reset-wal", false, "reset WAL by moving existing file aside (creates a .bak.<ts> file)")
 	flag.Parse()
 
-	// For now I just hardcode a WAL file in the current dir. Later I can make this a flag or env var.
-	wal, err := storage.OpenFileWAL("driftq.wal")
+	// Optional safe reset: move existing WAL aside so we start fresh
+	if *resetWAL {
+		if _, err := os.Stat(*walPath); err == nil {
+			bak := fmt.Sprintf("%s.bak.%d", *walPath, time.Now().Unix())
+			if err := os.Rename(*walPath, bak); err != nil {
+				log.Fatalf("failed to reset WAL (rename): %v", err)
+			}
+			log.Printf("WAL reset: moved %s -> %s", *walPath, bak)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Fatalf("failed to stat WAL: %v", err)
+		}
+	}
+
+	wal, err := storage.OpenFileWAL(*walPath)
 	if err != nil {
 		log.Fatalf("failed to open WAL: %v", err)
 	}
