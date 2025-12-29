@@ -9,6 +9,12 @@ type ConsumeRequest struct {
 	LeaseMs int64  `json:"lease_ms,omitempty"` // handler will default if 0/missing
 }
 
+type VersionResponse struct {
+	Version    string `json:"version"`
+	Commit     string `json:"commit"`
+	WalEnabled bool   `json:"wal_enabled"`
+}
+
 type HealthzResponse struct {
 	Status string `json:"status"`
 }

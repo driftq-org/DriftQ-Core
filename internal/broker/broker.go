@@ -935,3 +935,7 @@ func (b *InMemoryBroker) ConsumeWithLease(ctx context.Context, topic, group, own
 
 	return out, nil
 }
+
+func (b *InMemoryBroker) WALEnabled() bool {
+	return b.wal != nil
+}
