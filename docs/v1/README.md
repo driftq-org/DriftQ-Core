@@ -1,11 +1,4 @@
-# DriftQ v1 — Core spec (consolidated)
-
-This file consolidates the old `docs/v1/v1.*.md` documents into a single v1 spec.
-
-- Scope: DriftQ-Core v1 semantics + `/v1/*` HTTP API surface.
-- Included sub-versions: **v1.1 → v1.6**
-
-## Contents
+## DriftQ v1 — Core Spec Contents
 
 - HTTP API Reference (v1)
 - Current implementation defaults (v1)
@@ -148,10 +141,10 @@ Produce a message to a topic.
 
 ### GET `/v1/consume` (NDJSON stream)
 
-Consume messages from a topic as a **stream** of JSON objects (one per line).  
+Consume messages from a topic as a **stream** of JSON objects (one per line).
 Content-Type: `application/x-ndjson; charset=utf-8`
 
-**Parameters (required):** `topic`, `group`, `owner`  
+**Parameters (required):** `topic`, `group`, `owner`
 **Optional:** `lease_ms` (defaults to 2000ms)
 
 **Query example:**
@@ -199,7 +192,7 @@ Ack a message you previously received.
 
 **Query params:** `?topic=t1&group=g1&partition=0&offset=12&owner=worker-a`
 
-**Response:** `204 No Content`  
+**Response:** `204 No Content`
 **If not owner:** `409 Conflict` with `{ "error": "FAILED_PRECONDITION", "message": "not owner" }`
 
 ---
@@ -215,7 +208,7 @@ Nack a message (record failure + schedule retry/redelivery).
 
 **Query params:** `?topic=t1&group=g1&partition=0&offset=12&owner=worker-a&reason=...`
 
-**Response:** `204 No Content`  
+**Response:** `204 No Content`
 **If not owner:** `409 Conflict` with `{ "error": "FAILED_PRECONDITION", "message": "not owner" }`
 
 ## Current implementation defaults (v1)
@@ -840,7 +833,7 @@ Workers can use `routing.label` to decide how to handle messages, and use v1.6 i
 
 ## DriftQ v1.6 — Idempotency + “Exactly-once-ish effects” (Semantics)
 
-> Implementation note (current /v1 HTTP API): consumer-side idempotency is tied to **(topic, group, owner, lease)**.  
+> Implementation note (current /v1 HTTP API): consumer-side idempotency is tied to **(topic, group, owner, lease)**.
 > `/v1/consume` requires `owner` (and optional `lease_ms`), and `/v1/ack` + `/v1/nack` require the same `owner` or they return **409**.
 
 This document defines the **v1.6 contract** so future changes don’t drift the meaning of “exactly-once-ish.”
