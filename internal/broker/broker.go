@@ -84,8 +84,8 @@ func NewInMemoryBrokerWithWALAndRouter(wal storage.WAL, r Router) *InMemoryBroke
 		router:            r,
 		ackTimeout:        2 * time.Second,
 		redeliverTick:     250 * time.Millisecond,
-		maxPartitionMsgs:  2,
-		maxPartitionBytes: 20,
+		maxPartitionMsgs:  100,
+		maxPartitionBytes: 64 * 1024, // 64KB
 		idem:              NewIdempotencyStoreWithWAL(wal, 10*time.Minute),
 		retryState:        make(map[string]map[string]map[int]map[int64]*retryStateEntry),
 	}
