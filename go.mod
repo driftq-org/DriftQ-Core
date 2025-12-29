@@ -1,3 +1,3 @@
 module github.com/driftq-org/DriftQ-Core
 
-go 1.25.4
+go 1.25
