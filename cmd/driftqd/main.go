@@ -22,6 +22,11 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
 )
 
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+)
+
 type server struct {
 	broker broker.Broker
 }
@@ -62,6 +67,7 @@ func main() {
 	v1Mux.HandleFunc("/ack", s.requireMethod(http.MethodPost)(s.handleAck))
 	v1Mux.HandleFunc("/nack", s.requireMethod(http.MethodPost)(s.handleNack))
 	v1Mux.HandleFunc("/topics", s.method(s.handleTopicsList, s.handleTopicsCreate))
+	v1Mux.HandleFunc("/version", s.requireMethod(http.MethodGet)(s.handleVersion))
 
 	// mount v1 under /v1/*
 	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
@@ -162,6 +168,35 @@ func (s *server) method(get, post http.HandlerFunc) http.HandlerFunc {
 			v1.WriteError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		}
 	}
+}
+
+func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		v1.MethodNotAllowed(w, http.MethodGet)
+		return
+	}
+
+	version := strings.TrimSpace(buildVersion)
+	if version == "" {
+		version = "dev"
+	}
+
+	commit := strings.TrimSpace(buildCommit)
+	if commit == "" {
+		commit = "unknown"
+	}
+
+	type walEnabled interface{ WALEnabled() bool }
+	walOn := false
+	if b, ok := any(s.broker).(walEnabled); ok {
+		walOn = b.WALEnabled()
+	}
+
+	v1.WriteJSON(w, http.StatusOK, v1.VersionResponse{
+		Version:    version,
+		Commit:     commit,
+		WalEnabled: walOn,
+	})
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
