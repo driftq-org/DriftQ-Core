@@ -34,3 +34,4 @@ go.work.sum
 # DriftQ WAL files
 driftq.wal
 *.wal
+*.wal.bak*
