@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,6 +35,81 @@ type server struct {
 }
 
 type TestRouter struct{}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusRecorder) Write(p []byte) (int, error) {
+	// If WriteHeader wasn't called, net/http assumes 200.
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+
+func newRequestID() string {
+	// 12 bytes => 24 hex chars (plenty for logs)
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// extremely unlikely; fall back to timestamp-ish
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func remoteIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host
+	}
+	return addr
+}
+
+func withRequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if reqID == "" {
+			reqID = newRequestID()
+		}
+		// echo back so clients can correlate
+		w.Header().Set("X-Request-Id", reqID)
+
+		rec := &statusRecorder{ResponseWriter: w}
+
+		defer func() {
+			dur := time.Since(start)
+
+			logFn := slog.Info
+			if rec.status >= 500 {
+				logFn = slog.Error
+			}
+
+			logFn("http",
+				"req_id", reqID,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rec.status,
+				"bytes", rec.bytes,
+				"duration_ms", dur.Milliseconds(),
+				"remote_ip", remoteIP(r.RemoteAddr),
+			)
+		}()
+
+		next.ServeHTTP(rec, r)
+	})
+}
 
 func parseLogLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -161,14 +239,14 @@ func main() {
 		v1.WriteError(w, http.StatusNotFound, "NOT_FOUND", "use /v1/* endpoints")
 	})
 
+	handler := withRequestLogging(rootMux)
+
 	srv := &http.Server{
 		Addr:         *addr,
-		Handler:      rootMux,
+		Handler:      handler,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0,
-
-		// Route net/http's internal logs into logger (panic traces, TLS errors, and other stuff)
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		ErrorLog:     slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
 	slog.Info("broker starting", "addr", *addr)
