@@ -248,40 +248,12 @@ func main() {
 		[]string{"topic", "reason"},
 	)
 
-	inflightGauge := prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "inflight_messages",
-			Help: "Current number of in-flight messages per topic/group/partition.",
-		},
-		[]string{"topic", "group", "partition"},
-	)
-
-	prometheus.MustRegister(produceRejected, dlqTotal, inflightGauge)
+	prometheus.MustRegister(produceRejected, dlqTotal, NewBrokerCollector(b))
 
 	b.SetMetricsSink(&promSink{
 		produceRejected: produceRejected,
 		dlqTotal:        dlqTotal,
 	})
-
-	go func() {
-		t := time.NewTicker(1 * time.Second)
-		defer t.Stop()
-
-		for range t.C {
-			inflightGauge.Reset()
-
-			// We only have InMemoryBroker snapshot method, so this is a safe type assert
-			if ib, ok := any(b).(*broker.InMemoryBroker); ok {
-				for _, c := range ib.SnapshotInflightCounts(context.Background()) {
-					inflightGauge.WithLabelValues(
-						c.Topic,
-						c.Group,
-						strconv.Itoa(c.Partition),
-					).Set(float64(c.Count))
-				}
-			}
-		}
-	}()
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
