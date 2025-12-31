@@ -23,6 +23,8 @@ import (
 	"github.com/driftq-org/DriftQ-Core/internal/broker"
 	v1 "github.com/driftq-org/DriftQ-Core/internal/httpapi/v1"
 	"github.com/driftq-org/DriftQ-Core/internal/storage"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -40,6 +42,25 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status int
 	bytes  int
+}
+
+type promSink struct {
+	produceRejected *prometheus.CounterVec
+	dlqTotal        *prometheus.CounterVec
+}
+
+func (p *promSink) IncProduceRejected(reason string) {
+	p.produceRejected.WithLabelValues(reason).Inc()
+}
+
+func (p *promSink) IncDLQ(topic, reason string) {
+	p.dlqTotal.WithLabelValues(topic, reason).Inc()
+}
+
+func (w *statusRecorder) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (w *statusRecorder) WriteHeader(code int) {
@@ -211,6 +232,29 @@ func main() {
 		fatal("failed to replay WAL", err)
 	}
 
+	produceRejected := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "produce_rejected_total",
+			Help: "Total number of produce calls rejected (backpressure/overload).",
+		},
+		[]string{"reason"},
+	)
+
+	dlqTotal := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dlq_messages_total",
+			Help: "Total number of messages routed to DLQ.",
+		},
+		[]string{"topic", "reason"},
+	)
+
+	prometheus.MustRegister(produceRejected, dlqTotal)
+
+	b.SetMetricsSink(&promSink{
+		produceRejected: produceRejected,
+		dlqTotal:        dlqTotal,
+	})
+
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
 
@@ -233,6 +277,8 @@ func main() {
 
 	// mount v1 under /v1/*
 	rootMux.Handle("/v1/", http.StripPrefix("/v1", v1Mux))
+	// Prometheus scrape endpoint (not versioned yet)
+	rootMux.Handle("/metrics", promhttp.Handler())
 
 	// block unversioned routes
 	rootMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

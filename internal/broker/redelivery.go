@@ -177,6 +177,11 @@ func (b *InMemoryBroker) redeliverExpiredLocked() {
 							continue
 						}
 
+						// metrics hook
+						if b.metrics != nil {
+							b.metrics.IncDLQ(topic, "max_attempts_reached")
+						}
+
 						delete(inflight, offset)
 						_ = b.advanceOffsetLocked(topic, group, partition, offset)
 						b.purgeRetryStateLocked(topic, group, partition, offset)

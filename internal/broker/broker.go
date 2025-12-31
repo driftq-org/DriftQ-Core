@@ -53,12 +53,20 @@ type InMemoryBroker struct {
 	idem *IdempotencyStore
 
 	retryState map[string]map[string]map[int]map[int64]*retryStateEntry
+
+	metrics MetricsSink
 }
 
 func (b *InMemoryBroker) SetRouter(r Router) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.router = r
+}
+
+func (b *InMemoryBroker) SetMetricsSink(m MetricsSink) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.metrics = m
 }
 
 func NewInMemoryBroker() *InMemoryBroker {
@@ -765,6 +773,11 @@ func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Mess
 	if b.maxPartitionMsgs > 0 {
 		buffered := bufferedCount(ts.partitions[part], slowest)
 		if buffered >= b.maxPartitionMsgs {
+			// metrics hook
+			if b.metrics != nil {
+				b.metrics.IncProduceRejected("partition_buffer_full")
+			}
+
 			return &ProducerOverloadError{
 				Reason:     "partition_buffer_full",
 				RetryAfter: 1 * time.Second,
@@ -779,6 +792,11 @@ func (b *InMemoryBroker) produceLocked(_ context.Context, topic string, msg Mess
 		bufferedBytes += len(msg.Key) + len(msg.Value)
 
 		if bufferedBytes >= b.maxPartitionBytes {
+			// metrics hook
+			if b.metrics != nil {
+				b.metrics.IncProduceRejected("partition_buffer_bytes_full")
+			}
+
 			return &ProducerOverloadError{
 				Reason:     "partition_buffer_bytes_full",
 				RetryAfter: 1 * time.Second,
