@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,34 +33,104 @@ type server struct {
 
 type TestRouter struct{}
 
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "info", "":
+		fallthrough
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func normalizeOr(s, def string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+func configureLogger(levelStr, formatStr string) *slog.Logger {
+	level := parseLogLevel(levelStr)
+	format := strings.ToLower(strings.TrimSpace(formatStr))
+	if format == "" {
+		format = "text"
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var h slog.Handler
+	switch format {
+	case "json":
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	case "text":
+		fallthrough
+	default:
+		h = slog.NewTextHandler(os.Stderr, opts)
+	}
+
+	version := normalizeOr(buildVersion, "dev")
+	commit := normalizeOr(buildCommit, "unknown")
+
+	l := slog.New(h).With(
+		"service", "driftqd",
+		"version", version,
+		"commit", commit,
+	)
+
+	slog.SetDefault(l)
+	return l
+}
+
+func fatal(msg string, err error) {
+	if err != nil {
+		slog.Error(msg, "err", err)
+	} else {
+		slog.Error(msg)
+	}
+	os.Exit(1)
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	walPath := flag.String("wal", "driftq.wal", "path to WAL file")
 	resetWAL := flag.Bool("reset-wal", false, "reset WAL by moving existing file aside (creates a .bak.<ts> file)")
+
+	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+	logFormat := flag.String("log-format", "text", "log format: text|json")
+
 	flag.Parse()
+
+	logger := configureLogger(*logLevel, *logFormat)
 
 	// Optional safe reset: move existing WAL aside so we start fresh
 	if *resetWAL {
 		if _, err := os.Stat(*walPath); err == nil {
 			bak := fmt.Sprintf("%s.bak.%d", *walPath, time.Now().Unix())
 			if err := os.Rename(*walPath, bak); err != nil {
-				log.Fatalf("failed to reset WAL (rename): %v", err)
+				fatal("failed to reset WAL (rename)", err)
 			}
-			log.Printf("WAL reset: moved %s -> %s", *walPath, bak)
+			slog.Info("WAL reset", "from", *walPath, "to", bak)
 		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("failed to stat WAL: %v", err)
+			fatal("failed to stat WAL", err)
 		}
 	}
 
 	wal, err := storage.OpenFileWAL(*walPath)
 	if err != nil {
-		log.Fatalf("failed to open WAL: %v", err)
+		fatal("failed to open WAL", err)
 	}
 	defer wal.Close()
 
 	b, err := broker.NewInMemoryBrokerFromWAL(wal)
 	if err != nil {
-		log.Fatalf("failed to replay WAL: %v", err)
+		fatal("failed to replay WAL", err)
 	}
 
 	appCtx, appCancel := context.WithCancel(context.Background())
@@ -96,13 +166,16 @@ func main() {
 		Handler:      rootMux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0,
+
+		// Route net/http's internal logs into logger (panic traces, TLS errors, and other stuff)
+		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
-	log.Printf("DriftQ broker starting on %s\n", *addr)
+	slog.Info("broker starting", "addr", *addr)
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server error: %v", err)
+			fatal("http server error", err)
 		}
 	}()
 
@@ -111,17 +184,17 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
-	log.Println("shutting down...")
+	slog.Info("shutting down")
 	appCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("http shutdown error: %v", err)
+		slog.Error("http shutdown error", "err", err)
 	}
 
-	fmt.Println("DriftQ broker stopped")
+	slog.Info("broker stopped")
 }
 
 // requireMethod wraps a handler and rejects non-allowed methods with JSON 405 + Allow
